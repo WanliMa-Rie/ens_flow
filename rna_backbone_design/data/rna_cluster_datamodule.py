@@ -18,8 +18,25 @@ def length_batching_collate(batch):
     to deal with this situation by padding.
     """
 
-    lengths = [int(b["trans_1"].shape[0]) for b in batch]
+    def _seq_len(item, key: str) -> int:
+        x = item[key]
+        if key == "pair_embedding":
+            return int(min(x.shape[0], x.shape[1]))
+        return int(x.shape[0])
 
+    keys_for_len = [
+        "res_mask",
+        "aatype",
+        "is_na_residue_mask",
+        "trans_1",
+        "rotmats_1",
+        "single_embedding",
+        "torsion_angles_mask",
+        "torsion_angles_sin_cos",
+        "pair_embedding",
+    ]
+
+    lengths = [min(_seq_len(b, k) for k in keys_for_len) for b in batch]
     max_len = max(lengths)
     item0 = batch[0]
     B = len(batch)
@@ -28,61 +45,61 @@ def length_batching_collate(batch):
     out = item0["res_mask"].new_zeros((B, max_len))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["res_mask"]
+        out[i, :l] = b["res_mask"][:l]
     padded_batch["res_mask"] = out
 
     out = item0["aatype"].new_zeros((B, max_len))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["aatype"]
+        out[i, :l] = b["aatype"][:l]
     padded_batch["aatype"] = out
 
     out = item0["is_na_residue_mask"].new_zeros((B, max_len))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["is_na_residue_mask"]
+        out[i, :l] = b["is_na_residue_mask"][:l]
     padded_batch["is_na_residue_mask"] = out
 
     dims = item0["trans_1"].shape[1:]
     out = item0["trans_1"].new_zeros((B, max_len, *dims))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["trans_1"]
+        out[i, :l] = b["trans_1"][:l]
     padded_batch["trans_1"] = out
 
     dims = item0["rotmats_1"].shape[1:]
     out = item0["rotmats_1"].new_zeros((B, max_len, *dims))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["rotmats_1"]
+        out[i, :l] = b["rotmats_1"][:l]
     padded_batch["rotmats_1"] = out
 
     dims = item0["single_embedding"].shape[1:]
     out = item0["single_embedding"].new_zeros((B, max_len, *dims))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["single_embedding"]
+        out[i, :l] = b["single_embedding"][:l]
     padded_batch["single_embedding"] = out
 
     dims = item0["torsion_angles_mask"].shape[1:]
     out = item0["torsion_angles_mask"].new_zeros((B, max_len, *dims))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["torsion_angles_mask"]
+        out[i, :l] = b["torsion_angles_mask"][:l]
     padded_batch["torsion_angles_mask"] = out
 
     dims = item0["torsion_angles_sin_cos"].shape[1:]
     out = item0["torsion_angles_sin_cos"].new_zeros((B, max_len, *dims))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l] = b["torsion_angles_sin_cos"]
+        out[i, :l] = b["torsion_angles_sin_cos"][:l]
     padded_batch["torsion_angles_sin_cos"] = out
 
     dim = int(item0["pair_embedding"].shape[-1])
     out = item0["pair_embedding"].new_zeros((B, max_len, max_len, dim))
     for i, b in enumerate(batch):
         l = lengths[i]
-        out[i, :l, :l] = b["pair_embedding"]
+        out[i, :l, :l] = b["pair_embedding"][:l, :l]
     padded_batch["pair_embedding"] = out
 
     if "pdb_name" in item0:

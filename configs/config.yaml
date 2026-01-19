@@ -26,7 +26,7 @@ interpolant:
     train_schedule: linear
     sample_schedule: linear
   sampling:
-    num_timesteps: 50
+    num_timesteps: 60
   self_condition: ${model.edge_features.self_condition}
 
 model:
@@ -94,7 +94,7 @@ experiment:
     num_gt: 16
     max_batches: 1
   wandb:
-    name: rna-frameflow_cond_ensemble2
+    name: ensemble_flow_matching
     project: se3-fm
     save_code: false
     tags: []
@@ -107,7 +107,7 @@ experiment:
     # max_steps: 120000
     # min_steps: 1
     min_epochs: 1
-    max_epochs: 300
+    max_epochs: 200
     accelerator: gpu
     log_every_n_steps: 1
     deterministic: False
