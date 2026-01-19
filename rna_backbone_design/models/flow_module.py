@@ -44,7 +44,7 @@ class FlowModule(LightningModule):
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
 
-        self.validation_epoch_metrics = []
+        self.validation_epoch_metrics_by_loader = {"ensemble": [], "single": []}
         self.validation_epoch_samples = []
         self.save_hyperparameters()
 
@@ -253,8 +253,9 @@ class FlowModule(LightningModule):
             "torsion_loss": tors_loss,
         }
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         self.interpolant.set_device(batch["res_mask"].device)
+        loader_name = "ensemble" if int(dataloader_idx) == 0 else "single"
         res_mask = batch["res_mask"]
         mask_bool = res_mask > 0.5
         num_batch, num_res = res_mask.shape
@@ -270,7 +271,7 @@ class FlowModule(LightningModule):
         val_loss = total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
 
         self._log_scalar(
-            "valid/loss",
+            f"valid/{loader_name}_loss",
             val_loss,
             on_step=False,
             on_epoch=True,
@@ -325,9 +326,6 @@ class FlowModule(LightningModule):
             except RuntimeError:
                 aligned_pred_c4 = pred_c4
 
-        rmsd_c4 = metrics.rmsd(gt_c4, aligned_pred_c4, mask=mask_bool.float())
-        rmsd_c4 = torch.where(valid_align, rmsd_c4, torch.full_like(rmsd_c4, torch.nan))
-
         batch_metrics = []
         pred_atoms_np = pred_atoms.detach().cpu().numpy()
         gt_atoms_np = gt_atoms.detach().cpu().numpy()
@@ -344,10 +342,20 @@ class FlowModule(LightningModule):
             num_generated = int(getattr(ensemble_cfg, "num_generated", 0))
             num_gt = int(getattr(ensemble_cfg, "num_gt", 0))
 
+        rmsd_c4 = None
+        if loader_name == "single":
+            rmsd_c4 = metrics.rmsd(gt_c4, aligned_pred_c4, mask=mask_bool.float())
+            rmsd_c4 = torch.where(
+                valid_align, rmsd_c4, torch.full_like(rmsd_c4, torch.nan)
+            )
+
         for i in range(num_batch):
             valid_len = int(mask_np[i].sum())
 
-            c4_metrics = {"rmsd_c4": float(rmsd_c4.detach().cpu().numpy()[i])}
+            c4_metrics = {}
+            if loader_name == "single":
+                assert rmsd_c4 is not None
+                c4_metrics["rmsd_c4"] = float(rmsd_c4.detach().cpu().numpy()[i])
 
             gt_ens_list = batch.get("gt_c4_ensemble", None)
             gt_ens = None
@@ -355,7 +363,8 @@ class FlowModule(LightningModule):
                 gt_ens = gt_ens_list[i]
 
             if (
-                compute_ensemble
+                loader_name == "ensemble"
+                and compute_ensemble
                 and batch_idx < max_batches
                 and gt_ens is not None
                 and isinstance(gt_ens, torch.Tensor)
@@ -389,7 +398,7 @@ class FlowModule(LightningModule):
             batch_metrics.append(c4_metrics)
 
 
-            if batch_idx == 0 and i == 0:
+            if loader_name == "single" and batch_idx == 0 and i == 0:
                 # Perform actual generative sampling (from noise) for visualization
                 # This uses the embeddings from the validation set but generates structure from scratch
                 context = {
@@ -423,7 +432,9 @@ class FlowModule(LightningModule):
                         [saved_rna_path, self.global_step, wandb.Molecule(saved_rna_path)]
                     )
 
-        self.validation_epoch_metrics.append(pd.DataFrame(batch_metrics))
+        self.validation_epoch_metrics_by_loader[loader_name].append(
+            pd.DataFrame(batch_metrics)
+        )
 
     def on_validation_epoch_end(self):
         if len(self.validation_epoch_samples) > 0:
@@ -434,18 +445,20 @@ class FlowModule(LightningModule):
             )
             self.validation_epoch_samples.clear()
 
-        val_epoch_metrics = pd.concat(self.validation_epoch_metrics)
-
-        for metric_name, metric_val in val_epoch_metrics.mean().to_dict().items():
-            self._log_scalar(
-                f"valid/{metric_name}",
-                metric_val,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                batch_size=len(val_epoch_metrics),
-            )
-        self.validation_epoch_metrics.clear()
+        for loader_name, dfs in self.validation_epoch_metrics_by_loader.items():
+            if len(dfs) == 0:
+                continue
+            val_epoch_metrics = pd.concat(dfs)
+            for metric_name, metric_val in val_epoch_metrics.mean().to_dict().items():
+                self._log_scalar(
+                    f"valid/{metric_name}",
+                    metric_val,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=len(val_epoch_metrics),
+                )
+            self.validation_epoch_metrics_by_loader[loader_name].clear()
 
     def _log_scalar(
         self,

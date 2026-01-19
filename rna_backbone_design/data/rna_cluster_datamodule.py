@@ -1,97 +1,96 @@
+import math
+import pathlib
+
+import numpy as np
 import torch
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
+
 from rna_backbone_design.data.rna_cluster_dataset import RNAClusterDataset
+from rna_backbone_design.data import utils as du
 
 
 def length_batching_collate(batch):
     """
-    Simple collate function that stacks features.
-    Assumes batch items are already cropped/padded to same length
-    OR handles variable length by padding (if implemented).
-
-    Since RNAClusterDataset currently returns variable length sequences
-    (unless max_length is forced), we usually need to pad here.
+    Self-defined 'collate_fn' function.
+    In one batch, different sequence may have different length. 'length_batching_collate' is defined
+    to deal with this situation by padding.
     """
-    # Just use simple stacking if lengths are equal,
-    # otherwise we need a custom padder.
-    # For now, let's assume the user configures max_length or
-    # we implement basic padding logic here.
 
-    # Check if lengths vary
-    lengths = [b["trans_1"].shape[0] for b in batch]
+    lengths = [int(b["trans_1"].shape[0]) for b in batch]
+
     max_len = max(lengths)
-
-    # Keys to pad
-    keys_1d = ["res_mask", "aatype"]  # [L]
-    keys_2d = ["trans_1", "single_embedding", "torsion_angles_mask"]  # [L, D]
-    keys_3d = [
-        "rotmats_1",
-        "torsion_angles_sin_cos",
-        "alt_torsion_angles_sin_cos",
-    ]  # [L, 3, 3], [L, 7, 2]
-    keys_pair = ["pair_embedding"]  # [L, L, D]
-
-    padded_batch = {}
-
-    # Initialize basic lists for keys not in padding logic (like names)
-    padded_batch["pdb_name"] = [b["pdb_name"] for b in batch]
-    if "cluster_id" in batch[0]:
-        padded_batch["cluster_id"] = [b["cluster_id"] for b in batch]
-    if "gt_c4_ensemble" in batch[0]:
-        padded_batch["gt_c4_ensemble"] = [b.get("gt_c4_ensemble", None) for b in batch]
-        padded_batch["gt_ensemble_size"] = [b.get("gt_ensemble_size", None) for b in batch]
-    padded_batch["is_na_residue_mask"] = torch.ones(len(batch), max_len, dtype=torch.bool)
-
-    # Pre-allocate tensors
-    # To handle heterogeneous batches properly we need masking
-
-    # Let's inspect one item to get dimensions
     item0 = batch[0]
     B = len(batch)
+    padded_batch = {}
 
-    # 1. 2D features [B, L, D]
-    for k in keys_2d:
-        if k not in item0:
-            continue
-        dim = item0[k].shape[-1]
-        out = torch.zeros(B, max_len, dim, dtype=item0[k].dtype)
-        for i, b in enumerate(batch):
-            l = lengths[i]
-            out[i, :l] = b[k]
-        padded_batch[k] = out
+    out = item0["res_mask"].new_zeros((B, max_len))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["res_mask"]
+    padded_batch["res_mask"] = out
 
-    # 2. 1D features [B, L]
-    for k in keys_1d:
-        if k not in item0:
-            continue
-        out = torch.zeros(B, max_len, dtype=item0[k].dtype)
-        for i, b in enumerate(batch):
-            l = lengths[i]
-            out[i, :l] = b[k]
-        padded_batch[k] = out
+    out = item0["aatype"].new_zeros((B, max_len))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["aatype"]
+    padded_batch["aatype"] = out
 
-    # 3. 3D features [B, L, N, M]
-    for k in keys_3d:
-        if k not in item0:
-            continue
-        dims = item0[k].shape[1:]  # e.g. (3,3) or (10,2)
-        out = torch.zeros(B, max_len, *dims, dtype=item0[k].dtype)
-        for i, b in enumerate(batch):
-            l = lengths[i]
-            out[i, :l] = b[k]
-        padded_batch[k] = out
+    out = item0["is_na_residue_mask"].new_zeros((B, max_len))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["is_na_residue_mask"]
+    padded_batch["is_na_residue_mask"] = out
 
-    # 4. Pair features [B, L, L, D]
-    for k in keys_pair:
-        if k not in item0:
-            continue
-        dim = item0[k].shape[-1]
-        out = torch.zeros(B, max_len, max_len, dim, dtype=item0[k].dtype)
-        for i, b in enumerate(batch):
-            l = lengths[i]
-            out[i, :l, :l] = b[k]
-        padded_batch[k] = out
+    dims = item0["trans_1"].shape[1:]
+    out = item0["trans_1"].new_zeros((B, max_len, *dims))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["trans_1"]
+    padded_batch["trans_1"] = out
+
+    dims = item0["rotmats_1"].shape[1:]
+    out = item0["rotmats_1"].new_zeros((B, max_len, *dims))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["rotmats_1"]
+    padded_batch["rotmats_1"] = out
+
+    dims = item0["single_embedding"].shape[1:]
+    out = item0["single_embedding"].new_zeros((B, max_len, *dims))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["single_embedding"]
+    padded_batch["single_embedding"] = out
+
+    dims = item0["torsion_angles_mask"].shape[1:]
+    out = item0["torsion_angles_mask"].new_zeros((B, max_len, *dims))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["torsion_angles_mask"]
+    padded_batch["torsion_angles_mask"] = out
+
+    dims = item0["torsion_angles_sin_cos"].shape[1:]
+    out = item0["torsion_angles_sin_cos"].new_zeros((B, max_len, *dims))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l] = b["torsion_angles_sin_cos"]
+    padded_batch["torsion_angles_sin_cos"] = out
+
+    dim = int(item0["pair_embedding"].shape[-1])
+    out = item0["pair_embedding"].new_zeros((B, max_len, max_len, dim))
+    for i, b in enumerate(batch):
+        l = lengths[i]
+        out[i, :l, :l] = b["pair_embedding"]
+    padded_batch["pair_embedding"] = out
+
+    if "pdb_name" in item0:
+        padded_batch["pdb_name"] = [b["pdb_name"] for b in batch]
+    if "cluster_name" in item0:
+        padded_batch["cluster_name"] = [b["cluster_name"] for b in batch]
+    if "gt_c4_ensemble" in item0:
+        padded_batch["gt_c4_ensemble"] = [b.get("gt_c4_ensemble") for b in batch]
 
     return padded_batch
 
@@ -108,36 +107,39 @@ class RNAClusterDataModule(LightningDataModule):
         self.num_workers = data_cfg.num_workers
 
         self.train_dataset = None
-        self.val_dataset = None
+        self.val_ensemble_dataset = None
+        self.val_single_dataset = None
         self.test_dataset = None
 
     def setup(self, stage=None):
-        return_ensemble = bool(self.data_cfg.get("return_ensemble", False))
-        max_ensemble_conformers = self.data_cfg.get("max_ensemble_conformers", None)
-
+        common_kwargs = {
+            "data_dir": self.data_dir,
+            "max_length": self.data_cfg.get("max_len", None),
+            "return_ensemble": bool(getattr(self.data_cfg, "return_ensemble", True)),
+            "max_ensemble_conformers": getattr(self.data_cfg, "max_ensemble_conformers", None),
+            "cdhit_identity_threshold": float(getattr(self.data_cfg, "cdhit_identity_threshold", 0.8)),
+            "cdhit_word_length": int(getattr(self.data_cfg, "cdhit_word_length", 5)),
+            "split_val_fraction": float(getattr(self.data_cfg, "split_val_fraction", 0.1)),
+            "split_seed": int(getattr(self.data_cfg, "split_seed", 123)),
+            "cdhit_bin": str(getattr(self.data_cfg, "cdhit_bin", "cd-hit-est")),
+            "cdhit_threads": int(getattr(self.data_cfg, "cdhit_threads", 0)),
+            "split_cache_filename": str(getattr(self.data_cfg, "split_cache_filename", "split_cdhit80.json")),
+        }
         if stage in (None, "fit", "validate"):
             self.train_dataset = RNAClusterDataset(
-                data_dir=self.data_dir,
                 split="train",
-                max_length=self.data_cfg.get("max_len", None),
-                return_ensemble=False,
-                max_ensemble_conformers=max_ensemble_conformers,
+                **common_kwargs,
             )
-            self.val_dataset = RNAClusterDataset(
-                data_dir=self.data_dir,
-                split="val",
-                max_length=self.data_cfg.get("max_len", None),
-                return_ensemble=return_ensemble,
-                max_ensemble_conformers=max_ensemble_conformers,
+            self.val_ensemble_dataset = RNAClusterDataset(
+                split="val_ensemble",
+                **common_kwargs,
+            )
+            self.val_single_dataset = RNAClusterDataset(
+                split="val_single",
+                **common_kwargs,
             )
         if stage == "test" or stage is None:
-            self.test_dataset = RNAClusterDataset(
-                data_dir=self.data_dir,
-                split="test",
-                max_length=self.data_cfg.get("max_len", None),
-                return_ensemble=return_ensemble,
-                max_ensemble_conformers=max_ensemble_conformers,
-            )
+            self.test_dataset = None
 
     def train_dataloader(self):
         if self.train_dataset is None:
@@ -153,27 +155,29 @@ class RNAClusterDataModule(LightningDataModule):
         )
 
     def val_dataloader(self):
-        if self.val_dataset is None:
+        if self.val_ensemble_dataset is None or self.val_single_dataset is None:
             self.setup("fit")
-        assert self.val_dataset is not None
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=length_batching_collate,
-            pin_memory=True,
-        )
+        assert self.val_ensemble_dataset is not None
+        assert self.val_single_dataset is not None
+        return [
+            DataLoader(
+                self.val_ensemble_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                collate_fn=length_batching_collate,
+                pin_memory=True,
+            ),
+            DataLoader(
+                self.val_single_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                collate_fn=length_batching_collate,
+                pin_memory=True,
+            ),
+        ]
 
     def test_dataloader(self):
-        if self.test_dataset is None:
-            self.setup("test")
-        assert self.test_dataset is not None
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=length_batching_collate,
-            pin_memory=True,
-        )
+        loaders = self.val_dataloader()
+        return loaders[1]

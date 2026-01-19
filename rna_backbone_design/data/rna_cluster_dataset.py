@@ -1,7 +1,5 @@
-import hashlib
 from typing import Any, Dict, List, Optional
 import pathlib
-import json
 import random
 
 import numpy as np
@@ -9,8 +7,10 @@ import torch
 from torch.utils.data import Dataset
 
 from rna_backbone_design.data import data_transforms
+from rna_backbone_design.data import nucleotide_constants as nc
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.data.rigid_utils import Rigid
+from rna_backbone_design.data.cdhit_split import CDHitSplitConfig, load_or_build_split_manifest, collect_valid_cluster_dirs
 
 
 class RNAClusterDataset(Dataset):
@@ -23,11 +23,18 @@ class RNAClusterDataset(Dataset):
     def __init__(
         self,
         data_dir: str,
-        split: str = "train",  # "train", "val", "test"
+        split: str = "train",  # "train", "val_ensemble", "val_single", "val"
         max_length: Optional[int] = None,
         overfit: bool = False,
-        return_ensemble: bool = False,
+        return_ensemble: bool = True,
         max_ensemble_conformers: Optional[int] = None,
+        cdhit_identity_threshold: float = 0.8,
+        cdhit_word_length: int = 5,
+        split_val_fraction: float = 0.1,
+        split_seed: int = 123,
+        cdhit_bin: str = "cd-hit-est",
+        cdhit_threads: int = 0,
+        split_cache_filename: str = "split_cdhit80.json",
     ):
         """
         Args:
@@ -44,299 +51,167 @@ class RNAClusterDataset(Dataset):
         self.return_ensemble = return_ensemble
         self.max_ensemble_conformers = max_ensemble_conformers
 
-        # Gather all cluster directories
-        all_clusters = sorted(
-            [
-                d
-                for d in self.data_dir.iterdir()
-                if d.is_dir() and d.name.startswith("cluster_")
-            ]
+        valid_dirs = collect_valid_cluster_dirs(self.data_dir)
+        split_cfg = CDHitSplitConfig(
+            identity_threshold=cdhit_identity_threshold,
+            word_length=cdhit_word_length,
+            val_fraction=split_val_fraction,
+            seed=split_seed,
+            cdhit_bin=cdhit_bin,
+            threads=cdhit_threads,
+            cache_filename=split_cache_filename,
         )
+        manifest = load_or_build_split_manifest(self.data_dir, split_cfg)
 
-        # Stable hash-based split
-        self.clusters = []
-        for cluster_dir in all_clusters:
-            # Use MD5 hash of the cluster name for stable splitting
-            cluster_name = cluster_dir.name
-            hash_val = int(hashlib.md5(cluster_name.encode()).hexdigest(), 16)
-            percent = hash_val % 100
+        if split == "train":
+            keep = set(manifest["train"])
+        elif split == "val_ensemble":
+            keep = set(manifest["val_ensemble"])
+        elif split == "val_single":
+            keep = set(manifest["val_single"])
+        elif split == "val":
+            keep = set(manifest["val_ensemble"]) | set(manifest["val_single"])
+        else:
+            raise ValueError(
+                f"Invalid split '{split}'. Expected one of: train, val_ensemble, val_single, val."
+            )
 
-            if split == "train":
-                if percent < 80:
-                    self.clusters.append(cluster_dir)
-            elif split == "val":
-                if 80 <= percent < 90:
-                    self.clusters.append(cluster_dir)
-            elif split == "test":
-                if percent >= 90:
-                    self.clusters.append(cluster_dir)
-            else:
-                raise ValueError(f"Invalid split: {split}")
-
+        self.clusters = [d for d in valid_dirs if d.name in keep]
         if self.overfit:
             self.clusters = self.clusters[:2]
 
-        print(
-            f"RNAClusterDataset ({self.split}): Found {len(self.clusters)} clusters (out of {len(all_clusters)}) in {self.data_dir}"
-        )
+        print(f"RNAClusterDataset ({self.split}): {len(self.clusters)} clusters")
 
     def __len__(self) -> int:
         return len(self.clusters)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        start_idx = idx % len(self.clusters)
-        cluster_dir = None
-        pkl_path = None
-        raw_feats = None
+        cluster_dir = self.clusters[idx]
+        
+        # 1. Select a structure (conformer) from the cluster
+        feature_dir = cluster_dir / "features"
+        pkl_files = sorted(list(feature_dir.glob("*.pkl")))
+        # Since we filtered in __init__, we know pkl_files is not empty
+        pkl_path = random.choice(pkl_files)
+        raw_feats = du.read_pkl(str(pkl_path), verbose=False)
+        
+        # 2. Load shared embeddings
+        embedding_dir = cluster_dir / "embedding"
+        # We use the first available embedding; usually there's only one pair of single/pair per cluster
+        single_files = sorted(list(embedding_dir.glob("*_single.npy")))
+        pair_files = sorted(list(embedding_dir.glob("*_pair.npy")))
+        
+        single_embedding = torch.from_numpy(np.load(single_files[0])).float()
+        pair_embedding = torch.from_numpy(np.load(pair_files[0])).float()
 
-        for offset in range(len(self.clusters)):
-            candidate_cluster_dir = self.clusters[(start_idx + offset) % len(self.clusters)]
-            feature_dir = candidate_cluster_dir / "features"
-            pkl_files = list(feature_dir.glob("*.pkl"))
-            if not pkl_files:
-                continue
+        processed_feats = du.parse_complex_feats(raw_feats)
 
-            candidate_pkl_path = random.choice(pkl_files)
-            candidate_raw_feats = du.read_pkl(str(candidate_pkl_path))
-
-            embedding_dir = candidate_cluster_dir / "embedding"
-            single_files = sorted(list(embedding_dir.glob("*_single.npy")))
-            pair_files = sorted(list(embedding_dir.glob("*_pair.npy")))
-            if not single_files or not pair_files:
-                continue
-
-            cluster_dir = candidate_cluster_dir
-            pkl_path = candidate_pkl_path
-            raw_feats = candidate_raw_feats
-            break
-
-        if raw_feats is None or pkl_path is None or cluster_dir is None:
-            raise RuntimeError(
-                f"Unable to find valid (features + embedding) sample for split={self.split} under {self.data_dir}"
-            )
-
-        raw_feats = du.parse_complex_feats(raw_feats)
-
-        modeled_idx = raw_feats.get("modeled_idx", None)
-        if modeled_idx is None:
-            aatype_np = raw_feats["aatype"]
-            modeled_idx = np.where((aatype_np != 20) & (aatype_np != 26))[0]
-
-        min_idx = int(np.min(modeled_idx))
-        max_idx = int(np.max(modeled_idx))
-
-        full_len = int(raw_feats["aatype"].shape[0])
-        raw_feats = {
-            k: (
-                v[min_idx : (max_idx + 1)]
-                if (
-                    (isinstance(v, np.ndarray) and v.ndim >= 1 and int(v.shape[0]) == full_len)
-                    or (torch.is_tensor(v) and v.ndim >= 1 and int(v.shape[0]) == full_len)
+        modeled_idx = processed_feats.get("modeled_idx", None)
+        if modeled_idx is not None and len(modeled_idx) > 0:
+            min_idx = int(np.min(modeled_idx))
+            max_idx = int(np.max(modeled_idx))
+            full_len = int(np.asarray(processed_feats["aatype"]).shape[0])
+            processed_feats = {
+                k: (
+                    v[min_idx : (max_idx + 1)]
+                    if (
+                        isinstance(v, np.ndarray)
+                        and v.ndim >= 1
+                        and int(v.shape[0]) == full_len
+                    )
+                    else v
                 )
-                else v
-            )
-            for k, v in raw_feats.items()
-        }
+                for k, v in processed_feats.items()
+            }
 
         # Re-compute Geometry (Frames & Torsions) on-the-fly to match training pipeline
         # -----------------------------------------------------------------------------
         # 1. Convert to tensor
-        aatype_global = torch.from_numpy(raw_feats["aatype"]).long()
-        atom_positions = torch.from_numpy(raw_feats["atom_positions"]).double()
-        atom_mask = torch.from_numpy(raw_feats["atom_mask"]).double()
-        atom_deoxy = torch.from_numpy(raw_feats["atom_deoxy"]).bool()
+        aatype = torch.as_tensor(processed_feats["aatype"]).long()
+        atom_positions = torch.as_tensor(processed_feats["atom_positions"]).double()
+        atom_mask = torch.as_tensor(processed_feats["atom_mask"]).double()
+        atom_deoxy = torch.as_tensor(processed_feats["atom_deoxy"]).bool()
 
-        # 2. Slice to NA atoms (23)
-        # We assume the dataset contains RNA residues.
-        NUM_NA_RESIDUE_ATOMS = 23
-        tensor_feats = {
-            "aatype": aatype_global,
-            "all_atom_positions": atom_positions[:, :NUM_NA_RESIDUE_ATOMS],
-            "all_atom_mask": atom_mask[:, :NUM_NA_RESIDUE_ATOMS],
+        num_res = int(aatype.shape[0])
+        c4_idx = int(nc.atom_order["C4'"])
+        bb_mask_np = processed_feats.get("bb_mask", None)
+        if bb_mask_np is None:
+            bb_mask_np = np.asarray(atom_mask.detach().cpu().numpy()[:, c4_idx] > 0.5)
+        res_mask = torch.as_tensor(bb_mask_np).int()
+
+        is_na_residue_mask_np = processed_feats.get("is_na_residue_mask", None)
+        if is_na_residue_mask_np is None:
+            is_na_residue_mask_np = np.ones((num_res,), dtype=np.bool_)
+        is_na_residue_mask = torch.as_tensor(is_na_residue_mask_np).bool()
+
+        num_na_atoms = 23
+        na_feats = {
+            "aatype": aatype,
+            "all_atom_positions": atom_positions[:, :num_na_atoms],
+            "all_atom_mask": atom_mask[:, :num_na_atoms],
             "atom_deoxy": atom_deoxy,
         }
+        na_feats["atom23_gt_positions"] = na_feats["all_atom_positions"]
 
-        # Cache atom23 positions
-        tensor_feats["atom23_gt_positions"] = tensor_feats["all_atom_positions"]
-
-        # 3. Apply data transforms
-        tensor_feats = data_transforms.make_atom23_masks(tensor_feats)
+        na_feats = data_transforms.make_atom23_masks(na_feats)
         data_transforms.atom23_list_to_atom27_list(
-            tensor_feats, ["all_atom_positions", "all_atom_mask"], inplace=True
+            na_feats, ["all_atom_positions", "all_atom_mask"], inplace=True
         )
-        tensor_feats = data_transforms.atom27_to_frames(tensor_feats)
-        tensor_feats = data_transforms.atom27_to_torsion_angles()(tensor_feats)
+        na_feats = data_transforms.atom27_to_frames(na_feats)
+        na_feats = data_transforms.atom27_to_torsion_angles()(na_feats)
 
-        # Extract calculated features
-        # rigidgroups_gt_frames: [L, 11, 4, 4]
-        gt_frames_tensor = tensor_feats["rigidgroups_gt_frames"]
-        # torsion_angles: [L, 10, 2]
-        gt_torsions_sin_cos = tensor_feats["torsion_angles_sin_cos"]
-        gt_torsions_mask = tensor_feats["torsion_angles_mask"]
+        rigids_1 = Rigid.from_tensor_4x4(na_feats["rigidgroups_gt_frames"])[:, 0]
+        rotmats_1 = rigids_1.get_rots().get_rot_mats()
+        trans_1 = rigids_1.get_trans()
 
-        # -----------------------------------------------------------------------------
-
-        if "bb_mask" in raw_feats:
-            res_mask_base = torch.from_numpy(raw_feats["bb_mask"]).to(torch.float32)
-        else:
-            atom23_mask = tensor_feats["all_atom_mask"]
-            res_mask_base = (atom23_mask.sum(dim=-1) > 0).to(torch.float32)
-
-        # Extract basic info for length alignment
-        seq_len = aatype_global.shape[0]
-
-        embedding_dir = cluster_dir / "embedding"
-        single_files = sorted(list(embedding_dir.glob("*_single.npy")))
-        pair_files = sorted(list(embedding_dir.glob("*_pair.npy")))
-        single_embedding = torch.from_numpy(np.load(single_files[0])).float()
-        pair_embedding = torch.from_numpy(np.load(pair_files[0])).float()
-
-        # 4. Align Lengths (Features vs Embeddings)
-        emb_len = single_embedding.shape[0]
-        min_len = min(seq_len, emb_len)
-
-        # Helper to slice all relevant keys
-        def slice_tensor(t, length):
-            return t[:length]
-
-        # Load and Slice Features
-        # We assume these exist because we put them there in preprocessing
-        aatype = slice_tensor(aatype_global, min_len)
-        res_mask = slice_tensor(res_mask_base, min_len)
-
-        # rigidgroups_gt_frames: [L, 11, 4, 4] -> we slice to 1 for backbone frame if needed,
-        # but original code used 'frames_all = Rigid.from_tensor_4x4(rigidgroups_gt_frames)'
-        # so let's keep it as is.
-        rigidgroups_gt_frames = slice_tensor(gt_frames_tensor, min_len)
-
-        # torsion_angles: [L, 10, 2] -> we will slice to 8 later
-        torsion_angles_sin_cos = slice_tensor(gt_torsions_sin_cos, min_len)
-        torsion_angles_mask = slice_tensor(gt_torsions_mask, min_len)
-
-        single_embedding = single_embedding[:min_len]
-        pair_embedding = pair_embedding[:min_len, :min_len]
-
-        # 5. Cropping
-        if self.max_length is not None and min_len > self.max_length:
-            if self.split == "train":
-                start_idx = random.randint(0, min_len - self.max_length)
-            else:
-                start_idx = 0
-            end_idx = start_idx + self.max_length
-
-            aatype = aatype[start_idx:end_idx]
-            res_mask = res_mask[start_idx:end_idx]
-            rigidgroups_gt_frames = rigidgroups_gt_frames[start_idx:end_idx]
-            torsion_angles_sin_cos = torsion_angles_sin_cos[start_idx:end_idx]
-            torsion_angles_mask = torsion_angles_mask[start_idx:end_idx]
-            single_embedding = single_embedding[start_idx:end_idx]
-            pair_embedding = pair_embedding[start_idx:end_idx, start_idx:end_idx]
-
-            min_len = self.max_length
-
-        # 6. Extract SE(3) Targets from Precomputed Frames
-        # rigidgroups_gt_frames is [L, 1, 4, 4] (Flat Rigids) or just [L, 1, 4, 4] for just backbone?
-        # In preprocessing we used data_transforms.atom27_to_frames which produces [L, 1, 4, 4] for 'rigidgroups_gt_frames'
-        # corresponding to the backbone frame.
-        frames_all = Rigid.from_tensor_4x4(rigidgroups_gt_frames)
-        frame_0 = frames_all[:, 0]  # [L]
-        trans_1 = frame_0.get_trans()
-        rotmats_1 = frame_0.get_rots().get_rot_mats()
-
-        is_na_residue_mask = torch.ones_like(res_mask).bool()
-
-        out = {
-            "aatype": aatype,  # [L]
-            "trans_1": trans_1.float(),  # [L, 3]
-            "rotmats_1": rotmats_1.float(),  # [L, 3, 3]
-            "torsion_angles_sin_cos": torsion_angles_sin_cos[
-                :, :8
-            ].float(),  # [L, 8, 2]
-            "torsion_angles_mask": torsion_angles_mask[:, :8].float(),  # [L, 8]
+        out: Dict[str, Any] = {
+            "aatype": aatype,
+            "trans_1": trans_1.float(),
+            "rotmats_1": rotmats_1.float(),
+            "torsion_angles_sin_cos": na_feats["torsion_angles_sin_cos"][:, :8].float(),
+            "torsion_angles_mask": na_feats["torsion_angles_mask"][:, :8].float(),
             "res_mask": res_mask,
             "is_na_residue_mask": is_na_residue_mask,
             "single_embedding": single_embedding,
             "pair_embedding": pair_embedding,
             "pdb_name": pkl_path.stem,
-            "cluster_id": cluster_dir.name,
+            "cluster_name": cluster_dir.name,
         }
 
-        if self.return_ensemble:
-            feature_dir = cluster_dir / "features"
-            all_pkl_files = sorted(list(feature_dir.glob("*.pkl")))
+        if self.split == "val_ensemble" and self.return_ensemble:
+            gt_coords: List[torch.Tensor] = []
+            k = len(pkl_files)
             if self.max_ensemble_conformers is not None:
-                all_pkl_files = all_pkl_files[: self.max_ensemble_conformers]
-
-            c4_idx = 3
-
-            def _conformer_c4(p: pathlib.Path) -> torch.Tensor:
-                feats = du.read_pkl(str(p))
-                feats = du.parse_complex_feats(feats)
-
-                modeled_idx_local = feats.get("modeled_idx", None)
-                if modeled_idx_local is None:
-                    aatype_np = feats["aatype"]
-                    modeled_idx_local = np.where((aatype_np != 20) & (aatype_np != 26))[0]
-
-                min_idx_local = int(np.min(modeled_idx_local))
-                max_idx_local = int(np.max(modeled_idx_local))
-                full_len_local = int(feats["aatype"].shape[0])
-                feats = {
-                    k: (
-                        v[min_idx_local : (max_idx_local + 1)]
-                        if (
-                            (isinstance(v, np.ndarray) and v.ndim >= 1 and int(v.shape[0]) == full_len_local)
-                            or (torch.is_tensor(v) and v.ndim >= 1 and int(v.shape[0]) == full_len_local)
+                k = min(k, int(self.max_ensemble_conformers))
+            for p in pkl_files[:k]:
+                feats_k = du.parse_complex_feats(du.read_pkl(str(p), verbose=False))
+                modeled_idx_k = feats_k.get("modeled_idx", None)
+                if modeled_idx_k is not None and len(modeled_idx_k) > 0:
+                    min_k = int(np.min(modeled_idx_k))
+                    max_k = int(np.max(modeled_idx_k))
+                    full_len_k = int(np.asarray(feats_k["aatype"]).shape[0])
+                    feats_k = {
+                        kk: (
+                            vv[min_k : (max_k + 1)]
+                            if (
+                                isinstance(vv, np.ndarray)
+                                and vv.ndim >= 1
+                                and int(vv.shape[0]) == full_len_k
+                            )
+                            else vv
                         )
-                        else v
-                    )
-                    for k, v in feats.items()
-                }
-
-                aatype_local = torch.from_numpy(feats["aatype"]).long()
-                atom_positions = torch.from_numpy(feats["atom_positions"]).double()
-                atom_mask = torch.from_numpy(feats["atom_mask"]).double()
-                atom_deoxy = torch.from_numpy(feats["atom_deoxy"]).bool()
-
-                num_na_residue_atoms = 23
-                t = {
-                    "aatype": aatype_local,
-                    "all_atom_positions": atom_positions[:, :num_na_residue_atoms],
-                    "all_atom_mask": atom_mask[:, :num_na_residue_atoms],
-                    "atom_deoxy": atom_deoxy,
-                }
-                t = data_transforms.make_atom23_masks(t)
-                data_transforms.atom23_list_to_atom27_list(
-                    t, ["all_atom_positions", "all_atom_mask"], inplace=True
-                )
-                atom27_pos = t["all_atom_positions"].float()
-
-                seq_len_local = int(aatype_local.shape[0])
-                emb_len_local = int(single_embedding.shape[0])
-                min_len_local = min(seq_len_local, emb_len_local)
-                atom27_pos = atom27_pos[:min_len_local]
-
-                if self.max_length is not None and min_len_local > self.max_length:
-                    if self.split == "train":
-                        start_idx_local = random.randint(0, min_len_local - self.max_length)
-                    else:
-                        start_idx_local = 0
-                    end_idx_local = start_idx_local + self.max_length
-                    atom27_pos = atom27_pos[start_idx_local:end_idx_local]
-
-                return atom27_pos[:, c4_idx]
-
-            ensemble_c4_list = []
-            for p in all_pkl_files:
-                try:
-                    ensemble_c4_list.append(_conformer_c4(p))
-                except Exception:
+                        for kk, vv in feats_k.items()
+                    }
+                atom_pos_k = torch.as_tensor(feats_k["atom_positions"]).float()
+                if atom_pos_k.ndim == 3 and int(atom_pos_k.shape[1]) > c4_idx:
+                    gt_coords.append(atom_pos_k[:, c4_idx])
+                elif atom_pos_k.ndim == 2 and int(atom_pos_k.shape[1]) == 3:
+                    gt_coords.append(atom_pos_k)
+                else:
                     continue
 
-            if len(ensemble_c4_list) > 0:
-                min_ens_len = min(int(x.shape[0]) for x in ensemble_c4_list)
-                ensemble_c4 = torch.stack([x[:min_ens_len] for x in ensemble_c4_list], dim=0)
-                out["gt_c4_ensemble"] = ensemble_c4
-                out["gt_ensemble_size"] = int(ensemble_c4.shape[0])
+            if len(gt_coords) >= 2:
+                min_len = min(int(x.shape[0]) for x in gt_coords)
+                out["gt_c4_ensemble"] = torch.stack([x[:min_len] for x in gt_coords], dim=0)
 
         return out

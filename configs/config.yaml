@@ -5,6 +5,13 @@ data_cfg:
   num_workers: 4
   return_ensemble: true
   max_ensemble_conformers: null
+  cdhit_identity_threshold: 0.8
+  cdhit_word_length: 5
+  cdhit_bin: cd-hit-est
+  cdhit_threads: 0
+  split_val_fraction: 0.2
+  split_seed: 123
+  split_cache_filename: split_cdhit80.json
   # Removed CSV related filtering params as they are not used by RNAClusterDataModule yet
   # max_len: 150 # Optional
   # min_len: 40  # Optional

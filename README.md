@@ -116,6 +116,14 @@ We use 4 RTX3090 40GB GPUs via DDP to train our model for 120K steps, which took
 uv run train_se3_flows.py
 ```
 
+### Train/validation split (CD-HIT)
+
+Training uses the `RNAClusterDataset` under `data_cfg.data_dir`, and constructs train/validation splits by clustering cluster sequences with **CD-HIT (cd-hit-est)** at **80% identity** to reduce sequence leakage. A cached manifest (default: `split_cdhit80.json`) is written into the data directory the first time it is built.
+
+Validation is further separated into:
+- **ensemble validation**: clusters with **≥ 5** structures (used to compute `ens_*` metrics)
+- **single validation**: clusters with **≤ 4** structures (used to compute `rmsd_c4`)
+
 After training, the final saved checkpoint can be found at `ckpt/se3-fm/rna-frameflow/last.ckpt` directory saved locally (not part of this repo); this `ckpt` directory is created automatically by `wandb`. We also store intermediate checkpoints for your reference. You can rename and shift this `last.ckpt` file where necessary to run inference.
 
 Alternatively, you can use our camera-ready baseline checkpoint. The config files necessary can be found inside `camera_ready_ckpts/`.

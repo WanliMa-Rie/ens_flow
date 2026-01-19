@@ -1,6 +1,6 @@
 """
 Inference script for Conditional RNA-FrameFlow.
-Iterates through the test split of the RNAClusterDataset and generates structures.
+Iterates through a chosen split of the RNAClusterDataset and generates structures.
 """
 
 import os
@@ -92,10 +92,19 @@ class Sampler:
             devices = [0]
         log.info(f"Using devices: {devices}")
 
-        # Use DataModule to get test dataloader
+        split = str(getattr(self._infer_cfg, "dataset_split", "val_single"))
         datamodule = RNAClusterDataModule(self._cfg.data_cfg)
-        datamodule.setup(stage="test")
-        dataloader = datamodule.test_dataloader()
+        datamodule.setup(stage="fit")
+        if split == "train":
+            dataloader = datamodule.train_dataloader()
+        elif split == "val_ensemble":
+            dataloader = datamodule.val_dataloader()[0]
+        elif split == "val_single":
+            dataloader = datamodule.val_dataloader()[1]
+        else:
+            raise ValueError(
+                f"Unsupported inference.dataset_split='{split}'. Expected: train, val_ensemble, val_single."
+            )
 
         trainer = Trainer(
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
