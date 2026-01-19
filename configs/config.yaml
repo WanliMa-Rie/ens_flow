@@ -1,6 +1,6 @@
 data_cfg:
   data_dir: data_ensemble/rna_ensemble_data # Path to ensemble data root
-  batch_size: 6  # 28
+  batch_size: 4  # 28
   max_batch_size: 12
   num_workers: 4
   return_ensemble: true
@@ -83,11 +83,11 @@ experiment:
     num_non_frame_atoms: 0 # choose from [0, 3, 7]
   ensemble_metrics:
     enabled: true
-    num_generated: 16
+    num_generated: 150
     num_gt: 16
     max_batches: 1
   wandb:
-    name: rna-frameflow_cond
+    name: rna-frameflow_cond_ensemble2
     project: se3-fm
     save_code: false
     tags: []
@@ -100,7 +100,7 @@ experiment:
     # max_steps: 120000
     # min_steps: 1
     min_epochs: 1
-    max_epochs: 200
+    max_epochs: 300
     accelerator: gpu
     log_every_n_steps: 1
     deterministic: False
