@@ -10,7 +10,6 @@ import csv
 import numpy as np
 import hydra
 import torch
-import GPUtil
 from pytorch_lightning import Trainer
 from omegaconf import DictConfig, OmegaConf
 
@@ -53,13 +52,13 @@ class Sampler:
             # Set-up config.
             OmegaConf.set_struct(cfg, False)
             OmegaConf.set_struct(ckpt_cfg, False)
-            cfg = OmegaConf.merge(cfg, ckpt_cfg)
+            # Merge checkpoint config with inference config (inference config overrides checkpoint)
+            cfg = OmegaConf.merge(ckpt_cfg, cfg)
         
         cfg.experiment.checkpointer.dirpath = "./"
 
         self._cfg = cfg
         self._infer_cfg = cfg.inference
-        self._samples_cfg = self._infer_cfg.samples
         self._rng = np.random.default_rng(self._infer_cfg.seed)
 
         # Set-up directories to write results to
@@ -75,22 +74,21 @@ class Sampler:
             OmegaConf.save(config=self._cfg, f=f)
 
         # Read checkpoint and initialize module.
+        # Allow loading OmegaConf DictConfig which is not in the default safe globals
         self._flow_module = FlowModule.load_from_checkpoint(
-            checkpoint_path=ckpt_path, cfg=cfg
+            checkpoint_path=ckpt_path, cfg=cfg, map_location="cpu", weights_only=False
         )
 
         self._flow_module.eval()
         self._flow_module._infer_cfg = self._infer_cfg
-        self._flow_module._samples_cfg = self._samples_cfg
         self._flow_module._output_dir = self._output_dir
 
     def run_sampling(self):
-        devices = GPUtil.getAvailable(order="memory", limit=8)[
-            : self._infer_cfg.num_gpus
-        ]
-        if not devices:
-            devices = [0]
-        log.info(f"Using devices: {devices}")
+        # Simplify device selection to rely on PyTorch Lightning / CUDA_VISIBLE_DEVICES
+        # GPUtil can cause issues with DDP if it returns global indices that conflict with
+        # the process's visible devices or if orderings mismatch.
+        devices = self._infer_cfg.num_gpus
+        log.info(f"Using {devices} devices (configured via num_gpus)")
 
         split = str(getattr(self._infer_cfg, "dataset_split", "val_single"))
         datamodule = RNAClusterDataModule(self._cfg.data_cfg)
@@ -108,7 +106,7 @@ class Sampler:
 
         trainer = Trainer(
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
-            strategy="ddp" if len(devices) > 1 else "auto",
+            strategy="ddp" if (isinstance(devices, int) and devices > 1) or (isinstance(devices, list) and len(devices) > 1) else "auto",
             devices=devices if torch.cuda.is_available() else "auto",
         )
 
@@ -149,6 +147,9 @@ class Sampler:
         log.info(
             f"Generated samples are stored here: {self._output_dir}"
         )
+        
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 @hydra.main(

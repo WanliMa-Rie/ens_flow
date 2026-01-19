@@ -6,6 +6,8 @@ https://github.com/microsoft/protein-frame-flow/blob/main/models/flow_module.py
 import torch
 import time
 import os
+import glob
+import shutil
 import random
 import wandb
 import numpy as np
@@ -539,6 +541,76 @@ class FlowModule(LightningModule):
             params=self.model.parameters(), **self._exp_cfg.optimizer
         )
 
+    def _save_gt_pdbs(self, cluster_id, gt_dir):
+        cfg = None
+        if hasattr(self, "hparams"):
+            try:
+                if "cfg" in self.hparams:
+                    cfg = self.hparams["cfg"]
+            except Exception:
+                cfg = None
+            if cfg is None:
+                cfg = getattr(self.hparams, "cfg", None)
+
+        data_dir = None
+        if cfg is not None:
+            try:
+                data_dir = cfg.data_cfg.data_dir
+            except Exception:
+                try:
+                    data_dir = cfg["data_cfg"]["data_dir"]
+                except Exception:
+                    data_dir = None
+
+        if not data_dir:
+            self._print_logger.warning(f"Missing data_cfg.data_dir; skipping GT for {cluster_id}")
+            return
+
+        cluster_dir = os.path.join(str(data_dir), cluster_id)
+        structure_dir = os.path.join(cluster_dir, "structure")
+
+        pdb_paths = []
+        if os.path.isdir(structure_dir):
+            pdb_paths = sorted(glob.glob(os.path.join(structure_dir, "*.pdb")))
+
+        if pdb_paths:
+            for src in pdb_paths:
+                dst = os.path.join(gt_dir, os.path.basename(src))
+                if os.path.exists(dst):
+                    continue
+                try:
+                    shutil.copy2(src, dst)
+                except Exception as e:
+                    self._print_logger.warning(f"Failed to copy GT PDB {src}: {e}")
+            return
+
+        feature_dir = os.path.join(cluster_dir, "features")
+        if not os.path.isdir(feature_dir):
+            self._print_logger.warning(f"Missing structure/features for {cluster_id}; skipping GT")
+            return
+
+        pkl_paths = sorted(glob.glob(os.path.join(feature_dir, "*.pkl")))
+        for pkl_path in pkl_paths:
+            name = os.path.splitext(os.path.basename(pkl_path))[0]
+            expected = os.path.join(gt_dir, f"na_{name}.pdb")
+            if os.path.exists(expected):
+                continue
+            try:
+                feats = du.read_pkl(pkl_path)
+                feats = du.parse_complex_feats(feats)
+                pos = feats["atom_positions"]
+                if pos.ndim == 3:
+                    n_res, n_atoms, _ = pos.shape
+                    if n_atoms < 37:
+                        pos = np.pad(pos, ((0, 0), (0, 37 - n_atoms), (0, 0)))
+                au.write_complex_to_pdbs(
+                    pos,
+                    os.path.join(gt_dir, name),
+                    is_na_residue_mask=np.ones(pos.shape[0], dtype=np.int64),
+                )
+            except Exception as e:
+                self._print_logger.warning(f"Failed to write GT from {pkl_path}: {e}")
+
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         device = batch["res_mask"].device
         interpolant = Interpolant(self._infer_cfg.interpolant)
@@ -572,12 +644,10 @@ class FlowModule(LightningModule):
         ensemble_cfg = getattr(self._infer_cfg, "ensemble", None)
         ensemble_enabled = False
         ensemble_num_generated = 0
-        ensemble_num_gt = 0
         ensemble_write_pdbs = False
         if ensemble_cfg is not None:
             ensemble_enabled = bool(getattr(ensemble_cfg, "enabled", False))
             ensemble_num_generated = int(getattr(ensemble_cfg, "num_generated", 0))
-            ensemble_num_gt = int(getattr(ensemble_cfg, "num_gt", 0))
             ensemble_write_pdbs = bool(getattr(ensemble_cfg, "write_ensemble_pdbs", False))
 
         for i in range(num_batch):
@@ -590,8 +660,17 @@ class FlowModule(LightningModule):
                 if isinstance(cluster_ids, list) and cluster_ids[i] is not None
                 else "unknown_cluster"
             )
-            sample_dir = os.path.join(self._output_dir, cluster_id, f"length_{sample_length}")
-            os.makedirs(sample_dir, exist_ok=True)
+            
+            if ensemble_enabled:
+                base_dir = os.path.join(self._output_dir, cluster_id)
+                sample_dir = os.path.join(base_dir, "sampled")
+                gt_dir = os.path.join(base_dir, "gt")
+                os.makedirs(sample_dir, exist_ok=True)
+                os.makedirs(gt_dir, exist_ok=True)
+                self._save_gt_pdbs(cluster_id, gt_dir)
+            else:
+                sample_dir = os.path.join(self._output_dir, cluster_id, f"length_{sample_length}")
+                os.makedirs(sample_dir, exist_ok=True)
 
             context = {
                 "single_embedding": batch["single_embedding"][i : i + 1, :sample_length],
@@ -660,10 +739,10 @@ class FlowModule(LightningModule):
                 and gt_ens is not None
                 and isinstance(gt_ens, torch.Tensor)
                 and ensemble_num_generated >= 2
-                and ensemble_num_gt >= 2
+                and int(gt_ens.shape[0]) >= 2
             ):
                 eff_len = min(sample_length, int(gt_ens.shape[1]))
-                k = min(ensemble_num_generated, ensemble_num_gt, int(gt_ens.shape[0]))
+                k = min(ensemble_num_generated, int(gt_ens.shape[0]))
                 if eff_len >= 3 and k >= 2:
                     context_ens = {
                         "single_embedding": batch["single_embedding"][

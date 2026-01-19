@@ -9,6 +9,8 @@ data_ensemble/**
 metadata/**
 metadata/
 configs/*.yaml
+generated_rna_bb_samples/**
+rna_ensemble_data.tar.gz
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files
