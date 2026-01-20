@@ -50,18 +50,31 @@ class FlowModule(LightningModule):
         self.validation_epoch_samples = []
         self.save_hyperparameters()
 
+    def on_fit_start(self):
+        if isinstance(self.logger, WandbLogger):
+            self.logger.experiment.define_metric("epoch")
+            self.logger.experiment.define_metric("train/*", step_metric="epoch")
+            self.logger.experiment.define_metric("valid/*", step_metric="epoch")
+
     def on_train_start(self):
         self._epoch_start_time = time.time()
 
     def on_train_epoch_end(self):
-        epoch_time = (time.time() - self._epoch_start_time) / 60.0
-        self.log(
-            "train/epoch_time_minutes",
-            epoch_time,
+        self._log_scalar(
+            "epoch",
+            float(self.current_epoch),
             on_step=False,
             on_epoch=True,
             prog_bar=False,
         )
+        # epoch_time = (time.time() - self._epoch_start_time) / 60.0
+        # self.log(
+        #     "train/epoch_time_minutes",
+        #     epoch_time,
+        #     on_step=False,
+        #     on_epoch=True,
+        #     prog_bar=False,
+        # )
         self._epoch_start_time = time.time()
 
     def model_step(self, noisy_batch):
@@ -300,7 +313,7 @@ class FlowModule(LightningModule):
             num_batch, num_res, num_torsions * 2
         )
 
-        is_na_residue_mask = batch["is_na_residue_mask"].bool()
+        is_na_residue_mask = torch.ones_like(res_mask, dtype=torch.bool)
         gt_atoms = rna_all_atom.to_atom37_rna(
             gt_trans_1, gt_rotmats_1, is_na_residue_mask, torsions=gt_torsions_1
         )
@@ -328,11 +341,6 @@ class FlowModule(LightningModule):
             except RuntimeError:
                 aligned_pred_c4 = pred_c4
 
-        batch_metrics = []
-        pred_atoms_np = pred_atoms.detach().cpu().numpy()
-        gt_atoms_np = gt_atoms.detach().cpu().numpy()
-        mask_np = mask_bool.detach().cpu().numpy()
-
         ensemble_cfg = getattr(self._exp_cfg, "ensemble_metrics", None)
         compute_ensemble = False
         max_batches = 0
@@ -351,10 +359,12 @@ class FlowModule(LightningModule):
                 valid_align, rmsd_c4, torch.full_like(rmsd_c4, torch.nan)
             )
 
+        batch_metrics = []
+        mask_np = mask_bool.detach().cpu().numpy()
         for i in range(num_batch):
             valid_len = int(mask_np[i].sum())
-
             c4_metrics = {}
+
             if loader_name == "single":
                 assert rmsd_c4 is not None
                 c4_metrics["rmsd_c4"] = float(rmsd_c4.detach().cpu().numpy()[i])
@@ -397,63 +407,21 @@ class FlowModule(LightningModule):
                             "ens_pairwise_rmsd_r": ens.pairwise_rmsd_r,
                         }
                     )
+
             batch_metrics.append(c4_metrics)
-
-
-            if loader_name == "single" and batch_idx == 0 and i == 0:
-                # Perform actual generative sampling (from noise) for visualization
-                # This uses the embeddings from the validation set but generates structure from scratch
-                context = {
-                    "single_embedding": batch["single_embedding"][i : i + 1, :valid_len],
-                    "pair_embedding": batch["pair_embedding"][i : i + 1, :valid_len, :valid_len],
-                }
-                # Sample returns list of [B, N, 37, 3] tensors
-                atom37_traj, _, _ = self.interpolant.sample(
-                    1, valid_len, self.model, context=context
-                )
-                # Take the last step (final generated structure) and the first batch item
-                generated_sample = atom37_traj[-1][0].detach().cpu().numpy()
-
-                restype = None
-                if "aatype" in batch:
-                    restype = batch["aatype"][i, :valid_len].detach().cpu().numpy()
-                
-                # Save generated sample with unique name including epoch/step
-                filename = f"generated_epoch_{self.current_epoch}_step_{self.global_step}_len_{valid_len}.pdb"
-                saved_rna_path = au.write_complex_to_pdbs(
-                    generated_sample,
-                    os.path.join(
-                        self._sample_write_dir,
-                        filename,
-                    ),
-                    is_na_residue_mask=mask_np[i, :valid_len],
-                    restype=restype,
-                )
-                if isinstance(self.logger, WandbLogger):
-                    self.validation_epoch_samples.append(
-                        [saved_rna_path, self.global_step, wandb.Molecule(saved_rna_path)]
-                    )
 
         self.validation_epoch_metrics_by_loader[loader_name].append(
             pd.DataFrame(batch_metrics)
         )
 
     def on_validation_epoch_end(self):
-        if len(self.validation_epoch_samples) > 0:
-            self.logger.log_table(
-                key="valid/samples",
-                columns=["sample_path", "global_step", "RNA"],
-                data=self.validation_epoch_samples,
-            )
-            self.validation_epoch_samples.clear()
-
         for loader_name, dfs in self.validation_epoch_metrics_by_loader.items():
             if len(dfs) == 0:
                 continue
             val_epoch_metrics = pd.concat(dfs)
             for metric_name, metric_val in val_epoch_metrics.mean().to_dict().items():
                 self._log_scalar(
-                    f"valid/{metric_name}",
+                    f"valid/{loader_name}_{metric_name}",
                     metric_val,
                     on_step=False,
                     on_epoch=True,
@@ -491,7 +459,6 @@ class FlowModule(LightningModule):
         Performs one iteration of SE(3) flow matching and returns total training loss
         using the core and auxiliary losses computed in `model_step`.
         """
-        step_start_time = time.time()
         self.interpolant.set_device(batch["res_mask"].device)
         noisy_batch = self.interpolant.corrupt_batch(batch)
 
@@ -505,34 +472,58 @@ class FlowModule(LightningModule):
         total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
 
         for k, v in total_losses.items():
-            self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
+            self._log_scalar(
+                f"train/{k}",
+                v,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=num_batch,
+            )
 
-        # Losses to track. Stratified across t.
-        t = torch.squeeze(noisy_batch["t"])
-        self._log_scalar(
-            "train/t", np.mean(du.to_numpy(t)), prog_bar=False, batch_size=num_batch
-        )
-        for loss_name, loss_dict in batch_losses.items():
-            stratified_losses = mu.t_stratified_loss(t, loss_dict, loss_name=loss_name)
-            for k, v in stratified_losses.items():
-                self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
+        # # Losses to track. Stratified across t.
+        # t = torch.squeeze(noisy_batch["t"])
+        # self._log_scalar(
+        #     "train/t", np.mean(du.to_numpy(t)), prog_bar=False, batch_size=num_batch
+        # )
+        # for loss_name, loss_dict in batch_losses.items():
+        #     stratified_losses = mu.t_stratified_loss(t, loss_dict, loss_name=loss_name)
+        #     for k, v in stratified_losses.items():
+        #         self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
 
-        # Training throughput
-        self._log_scalar(
-            "train/length",
-            batch["res_mask"].shape[1],
-            prog_bar=False,
-            batch_size=num_batch,
-        )
-        self._log_scalar("train/batch_size", num_batch, prog_bar=False)
-
-        step_time = time.time() - step_start_time
-        self._log_scalar("train/eps", num_batch / step_time)
+        # # Training throughput
+        # self._log_scalar(
+        #     "train/length",
+        #     batch["res_mask"].shape[1],
+        #     prog_bar=False,
+        #     batch_size=num_batch,
+        # )
+        # self._log_scalar("train/batch_size", num_batch, prog_bar=False)
+        #
+        # step_time = time.time() - step_start_time
+        # self._log_scalar("train/eps", num_batch / step_time)
 
         train_loss = (
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
-        self._log_scalar("train/loss", train_loss, batch_size=num_batch)
+        self.log(
+            "pbar/loss",
+            train_loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            logger=False,
+            batch_size=num_batch,
+            rank_zero_only=True,
+        )
+        self._log_scalar(
+            "train/loss",
+            train_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=num_batch,
+        )
 
         return train_loss
 
@@ -542,37 +533,19 @@ class FlowModule(LightningModule):
         )
 
     def _save_gt_pdbs(self, cluster_id, gt_dir):
-        cfg = None
-        if hasattr(self, "hparams"):
+        cfg = getattr(getattr(self, "hparams", None), "cfg", None)
+        data_dir = getattr(getattr(cfg, "data_cfg", None), "data_dir", None)
+        if data_dir is None and cfg is not None:
             try:
-                if "cfg" in self.hparams:
-                    cfg = self.hparams["cfg"]
+                data_dir = cfg["data_cfg"]["data_dir"]
             except Exception:
-                cfg = None
-            if cfg is None:
-                cfg = getattr(self.hparams, "cfg", None)
-
-        data_dir = None
-        if cfg is not None:
-            try:
-                data_dir = cfg.data_cfg.data_dir
-            except Exception:
-                try:
-                    data_dir = cfg["data_cfg"]["data_dir"]
-                except Exception:
-                    data_dir = None
-
+                data_dir = None
         if not data_dir:
-            self._print_logger.warning(f"Missing data_cfg.data_dir; skipping GT for {cluster_id}")
             return
 
-        cluster_dir = os.path.join(str(data_dir), cluster_id)
-        structure_dir = os.path.join(cluster_dir, "structure")
-
-        pdb_paths = []
-        if os.path.isdir(structure_dir):
-            pdb_paths = sorted(glob.glob(os.path.join(structure_dir, "*.pdb")))
-
+        pdb_paths = sorted(
+            glob.glob(os.path.join(str(data_dir), cluster_id, "structure", "*.pdb"))
+        )
         if pdb_paths:
             for src in pdb_paths:
                 dst = os.path.join(gt_dir, os.path.basename(src))
@@ -584,12 +557,9 @@ class FlowModule(LightningModule):
                     self._print_logger.warning(f"Failed to copy GT PDB {src}: {e}")
             return
 
-        feature_dir = os.path.join(cluster_dir, "features")
-        if not os.path.isdir(feature_dir):
-            self._print_logger.warning(f"Missing structure/features for {cluster_id}; skipping GT")
-            return
-
-        pkl_paths = sorted(glob.glob(os.path.join(feature_dir, "*.pkl")))
+        pkl_paths = sorted(
+            glob.glob(os.path.join(str(data_dir), cluster_id, "features", "*.pkl"))
+        )
         for pkl_path in pkl_paths:
             name = os.path.splitext(os.path.basename(pkl_path))[0]
             expected = os.path.join(gt_dir, f"na_{name}.pdb")
@@ -600,7 +570,7 @@ class FlowModule(LightningModule):
                 feats = du.parse_complex_feats(feats)
                 pos = feats["atom_positions"]
                 if pos.ndim == 3:
-                    n_res, n_atoms, _ = pos.shape
+                    _, n_atoms, _ = pos.shape
                     if n_atoms < 37:
                         pos = np.pad(pos, ((0, 0), (0, 37 - n_atoms), (0, 0)))
                 au.write_complex_to_pdbs(
@@ -625,7 +595,7 @@ class FlowModule(LightningModule):
         gt_torsions_1 = batch["torsion_angles_sin_cos"][:, :, :8, :].reshape(
             num_batch, -1, 16
         )
-        is_na_residue_mask = batch["is_na_residue_mask"].bool()
+        is_na_residue_mask = torch.ones_like(res_mask, dtype=torch.bool)
         gt_atoms = rna_all_atom.to_atom37_rna(
             gt_trans_1, gt_rotmats_1, is_na_residue_mask, torsions=gt_torsions_1
         )

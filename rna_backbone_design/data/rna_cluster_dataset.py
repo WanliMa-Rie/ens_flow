@@ -80,19 +80,36 @@ class RNAClusterDataset(Dataset):
         if self.overfit:
             self.clusters = self.clusters[:2]
 
+        self.items: Optional[List[Dict[str, Any]]] = None
+        if self.split == "train":
+            items: List[Dict[str, Any]] = []
+            for cluster_dir in self.clusters:
+                feature_dir = cluster_dir / "features"
+                pkl_files = sorted(list(feature_dir.glob("*.pkl")))
+                for pkl_path in pkl_files:
+                    items.append({"cluster_dir": cluster_dir, "pkl_path": pkl_path})
+            self.items = items
+
         print(f"RNAClusterDataset ({self.split}): {len(self.clusters)} clusters")
 
     def __len__(self) -> int:
+        if self.items is not None:
+            return len(self.items)
         return len(self.clusters)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        cluster_dir = self.clusters[idx]
+        if self.items is not None:
+            item = self.items[idx]
+            cluster_dir = item["cluster_dir"]
+            pkl_path = item["pkl_path"]
+        else:
+            cluster_dir = self.clusters[idx]
         
         # 1. Select a structure (conformer) from the cluster
         feature_dir = cluster_dir / "features"
         pkl_files = sorted(list(feature_dir.glob("*.pkl")))
-        # Since we filtered in __init__, we know pkl_files is not empty
-        pkl_path = random.choice(pkl_files)
+        if self.items is None:
+            pkl_path = random.choice(pkl_files)
         raw_feats = du.read_pkl(str(pkl_path), verbose=False)
         
         # 2. Load shared embeddings
