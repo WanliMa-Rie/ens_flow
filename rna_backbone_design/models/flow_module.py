@@ -459,7 +459,6 @@ class FlowModule(LightningModule):
         Performs one iteration of SE(3) flow matching and returns total training loss
         using the core and auxiliary losses computed in `model_step`.
         """
-        step_start_time = time.time()
         self.interpolant.set_device(batch["res_mask"].device)
         noisy_batch = self.interpolant.corrupt_batch(batch)
 
@@ -534,37 +533,19 @@ class FlowModule(LightningModule):
         )
 
     def _save_gt_pdbs(self, cluster_id, gt_dir):
-        cfg = None
-        if hasattr(self, "hparams"):
+        cfg = getattr(getattr(self, "hparams", None), "cfg", None)
+        data_dir = getattr(getattr(cfg, "data_cfg", None), "data_dir", None)
+        if data_dir is None and cfg is not None:
             try:
-                if "cfg" in self.hparams:
-                    cfg = self.hparams["cfg"]
+                data_dir = cfg["data_cfg"]["data_dir"]
             except Exception:
-                cfg = None
-            if cfg is None:
-                cfg = getattr(self.hparams, "cfg", None)
-
-        data_dir = None
-        if cfg is not None:
-            try:
-                data_dir = cfg.data_cfg.data_dir
-            except Exception:
-                try:
-                    data_dir = cfg["data_cfg"]["data_dir"]
-                except Exception:
-                    data_dir = None
-
+                data_dir = None
         if not data_dir:
-            self._print_logger.warning(f"Missing data_cfg.data_dir; skipping GT for {cluster_id}")
             return
 
-        cluster_dir = os.path.join(str(data_dir), cluster_id)
-        structure_dir = os.path.join(cluster_dir, "structure")
-
-        pdb_paths = []
-        if os.path.isdir(structure_dir):
-            pdb_paths = sorted(glob.glob(os.path.join(structure_dir, "*.pdb")))
-
+        pdb_paths = sorted(
+            glob.glob(os.path.join(str(data_dir), cluster_id, "structure", "*.pdb"))
+        )
         if pdb_paths:
             for src in pdb_paths:
                 dst = os.path.join(gt_dir, os.path.basename(src))
@@ -576,12 +557,9 @@ class FlowModule(LightningModule):
                     self._print_logger.warning(f"Failed to copy GT PDB {src}: {e}")
             return
 
-        feature_dir = os.path.join(cluster_dir, "features")
-        if not os.path.isdir(feature_dir):
-            self._print_logger.warning(f"Missing structure/features for {cluster_id}; skipping GT")
-            return
-
-        pkl_paths = sorted(glob.glob(os.path.join(feature_dir, "*.pkl")))
+        pkl_paths = sorted(
+            glob.glob(os.path.join(str(data_dir), cluster_id, "features", "*.pkl"))
+        )
         for pkl_path in pkl_paths:
             name = os.path.splitext(os.path.basename(pkl_path))[0]
             expected = os.path.join(gt_dir, f"na_{name}.pdb")
@@ -592,7 +570,7 @@ class FlowModule(LightningModule):
                 feats = du.parse_complex_feats(feats)
                 pos = feats["atom_positions"]
                 if pos.ndim == 3:
-                    n_res, n_atoms, _ = pos.shape
+                    _, n_atoms, _ = pos.shape
                     if n_atoms < 37:
                         pos = np.pad(pos, ((0, 0), (0, 37 - n_atoms), (0, 0)))
                 au.write_complex_to_pdbs(
