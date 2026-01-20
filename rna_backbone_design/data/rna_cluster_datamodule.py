@@ -20,8 +20,6 @@ def length_batching_collate(batch):
 
     def _seq_len(item, key: str) -> int:
         x = item[key]
-        if key == "pair_embedding":
-            return int(min(x.shape[0], x.shape[1]))
         return int(x.shape[0])
 
     keys_for_len = [
@@ -131,7 +129,6 @@ class RNAClusterDataModule(LightningDataModule):
     def setup(self, stage=None):
         common_kwargs = {
             "data_dir": self.data_dir,
-            "max_length": self.data_cfg.get("max_len", None),
             "return_ensemble": bool(getattr(self.data_cfg, "return_ensemble", True)),
             "max_ensemble_conformers": getattr(self.data_cfg, "max_ensemble_conformers", None),
             "cdhit_identity_threshold": float(getattr(self.data_cfg, "cdhit_identity_threshold", 0.8)),
@@ -155,13 +152,11 @@ class RNAClusterDataModule(LightningDataModule):
                 split="val_single",
                 **common_kwargs,
             )
-        if stage == "test" or stage is None:
-            self.test_dataset = None
 
     def train_dataloader(self):
         if self.train_dataset is None:
             self.setup("fit")
-        assert self.train_dataset is not None
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -174,8 +169,6 @@ class RNAClusterDataModule(LightningDataModule):
     def val_dataloader(self):
         if self.val_ensemble_dataset is None or self.val_single_dataset is None:
             self.setup("fit")
-        assert self.val_ensemble_dataset is not None
-        assert self.val_single_dataset is not None
         return [
             DataLoader(
                 self.val_ensemble_dataset,
@@ -194,7 +187,3 @@ class RNAClusterDataModule(LightningDataModule):
                 pin_memory=True,
             ),
         ]
-
-    def test_dataloader(self):
-        loaders = self.val_dataloader()
-        return loaders[1]
