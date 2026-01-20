@@ -24,8 +24,6 @@ class RNAClusterDataset(Dataset):
         self,
         data_dir: str,
         split: str = "train",  # "train", "val_ensemble", "val_single", "val"
-        max_length: Optional[int] = None,
-        overfit: bool = False,
         return_ensemble: bool = True,
         max_ensemble_conformers: Optional[int] = None,
         cdhit_identity_threshold: float = 0.8,
@@ -41,13 +39,10 @@ class RNAClusterDataset(Dataset):
             data_dir: Path to the root directory containing cluster folders.
                       (e.g., 'data_ensemble/rna_ensemble_data')
             split: Data split to use (train, val, or test).
-            max_length: Optional maximum sequence length to filter or crop.
             overfit: If True, restricts the dataset to a small subset for debugging.
         """
         self.data_dir = pathlib.Path(data_dir)
         self.split = split
-        self.max_length = max_length
-        self.overfit = overfit
         self.return_ensemble = return_ensemble
         self.max_ensemble_conformers = max_ensemble_conformers
 
@@ -62,7 +57,6 @@ class RNAClusterDataset(Dataset):
             cache_filename=split_cache_filename,
         )
         manifest = load_or_build_split_manifest(self.data_dir, split_cfg)
-
         if split == "train":
             keep = set(manifest["train"])
         elif split == "val_ensemble":
@@ -77,8 +71,6 @@ class RNAClusterDataset(Dataset):
             )
 
         self.clusters = [d for d in valid_dirs if d.name in keep]
-        if self.overfit:
-            self.clusters = self.clusters[:2]
 
         self.items: Optional[List[Dict[str, Any]]] = None
         if self.split == "train":
@@ -98,18 +90,14 @@ class RNAClusterDataset(Dataset):
         return len(self.clusters)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        if self.items is not None:
-            item = self.items[idx]
-            cluster_dir = item["cluster_dir"]
-            pkl_path = item["pkl_path"]
-        else:
-            cluster_dir = self.clusters[idx]
+        item = self.items[idx]
+        cluster_dir = item["cluster_dir"]
+        pkl_path = item["pkl_path"]
         
         # 1. Select a structure (conformer) from the cluster
         feature_dir = cluster_dir / "features"
         pkl_files = sorted(list(feature_dir.glob("*.pkl")))
-        if self.items is None:
-            pkl_path = random.choice(pkl_files)
+        pkl_path = random.choice(pkl_files)
         raw_feats = du.read_pkl(str(pkl_path), verbose=False)
         
         # 2. Load shared embeddings
