@@ -90,9 +90,11 @@ class RNAClusterDataset(Dataset):
         return len(self.clusters)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = self.items[idx]
-        cluster_dir = item["cluster_dir"]
-        pkl_path = item["pkl_path"]
+        if self.items is not None:
+            item = self.items[idx]
+            cluster_dir = item["cluster_dir"]
+        else:
+            cluster_dir = self.clusters[idx]
         
         # 1. Select a structure (conformer) from the cluster
         feature_dir = cluster_dir / "features"

@@ -77,7 +77,6 @@ experiment:
     noise_per_sample: 1
     permute: False
   training:
-    min_plddt_mask: null
     loss: se3_vf_loss
     bb_atom_scale: 0.1
     trans_scale: 0.1

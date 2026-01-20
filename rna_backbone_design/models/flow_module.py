@@ -92,11 +92,7 @@ class FlowModule(LightningModule):
         training_cfg = self._exp_cfg.training
         loss_mask = noisy_batch["res_mask"]
         is_na_residue_mask = noisy_batch["is_na_residue_mask"]
-
-        if training_cfg.min_plddt_mask is not None:
-            plddt_mask = noisy_batch["res_plddt"] > training_cfg.min_plddt_mask
-            loss_mask *= plddt_mask
-
+        print(loss_mask.shape)
         num_batch, num_res = loss_mask.shape
 
         torsions_start_index = 0
