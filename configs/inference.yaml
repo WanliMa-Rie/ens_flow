@@ -33,6 +33,7 @@ inference:
 
   use_gpu: True
   num_gpus: 1
+  gpu_id: 1
 
   interpolant:
     min_t: 1e-2

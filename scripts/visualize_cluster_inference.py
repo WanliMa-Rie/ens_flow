@@ -101,7 +101,7 @@ def run(cfg: DictConfig) -> None:
 
     dataset = RNAClusterDataset(
         data_dir=cfg.data_cfg.data_dir,
-        split="test",
+        split="val",
         max_length=cfg.data_cfg.get("max_len", None),
         return_ensemble=bool(cfg.data_cfg.get("return_ensemble", False)),
         max_ensemble_conformers=cfg.data_cfg.get("max_ensemble_conformers", None),
