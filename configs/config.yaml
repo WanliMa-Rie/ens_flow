@@ -1,0 +1,113 @@
+data_cfg:
+  data_dir: /projects/u6bk/wanli/rna_ensemble_data # Path to ensemble data root
+  preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data
+  batch_size: 16  # 28
+  max_batch_size: 12
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+  posterior_nearest_p: 0
+  embedding_cache_size: 4
+  val_ensemble_as_cluster: true
+  test_ensemble_as_cluster: true
+
+interpolant:
+  min_t: 1e-2
+  rots:
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+  trans:
+    train_schedule: linear
+    sample_schedule: linear
+  sampling:
+    num_timesteps: 60
+  self_condition: ${model.edge_features.self_condition}
+
+model:
+  node_embed_size: 256
+  edge_embed_size: 128
+  symmetric: False
+  node_features:
+    c_s: ${model.node_embed_size}
+    c_pos_emb: 128
+    c_timestep_emb: 128
+    c_single_in: 384
+    embed_diffuse_mask: False
+    max_num_res: 2000
+    timestep_int: 1000
+  edge_features:
+    single_bias_transition_n: 2
+    c_s: ${model.node_embed_size}
+    c_p: ${model.edge_embed_size}
+    c_pair_in: 128
+    relpos_k: 64
+    use_rbf: True
+    num_rbf: 32
+    feat_dim: 64
+    num_bins: 22
+    self_condition: True
+  ipa:
+    c_s: ${model.node_embed_size}
+    c_z: ${model.edge_embed_size}
+    c_hidden: 128
+    no_heads: 8
+    no_qk_points: 8
+    no_v_points: 12
+    seq_tfmr_num_heads: 4
+    seq_tfmr_num_layers: 2
+    num_blocks: 4   # 6
+
+experiment:
+  seed: 123
+  num_devices: 4
+  use_swa: False
+  batch_ot:
+    enabled: True
+    cost: kabsch
+    noise_per_sample: 1
+    permute: False
+  training:
+    loss: se3_vf_loss
+    bb_atom_scale: 0.1
+    trans_scale: 0.1
+    translation_loss_weight: 2.0
+    t_normalize_clip: 0.9
+    rotation_loss_weights: 1.0
+    aux_loss_weight: 1.0
+    aux_loss_t_pass: 0.25
+    tors_loss_scale: 1.0
+    num_non_frame_atoms: 0 # choose from [0, 3, 7]
+  ensemble_metrics:
+    enabled: true
+    num_generated: 150
+    num_gt: 16
+    max_batches: 1
+  wandb:
+    name: baseline
+    project: velmix
+    save_code: false
+    tags: []
+    mode: "online" # can also save to `offline`
+  optimizer:
+    lr: 0.0001
+  trainer:
+    overfit_batches: 0
+    # max_steps: 120000
+    # min_steps: 1
+    min_epochs: 1
+    max_epochs: 1000
+    accelerator: gpu
+    log_every_n_steps: 1
+    deterministic: False
+    strategy: ddp
+    check_val_every_n_epoch: 10
+    accumulate_grad_batches: 1
+  checkpointer:
+    dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
+    save_last: True
+    save_top_k: 3
+    monitor: train/loss
+    mode: min
+    every_n_epochs: 20
