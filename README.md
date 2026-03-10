@@ -1,240 +1,237 @@
-# RNA-FrameFlow: Flow Matching for de novo 3D RNA Backbone Design
+# RNA-FrameFlow
 
-## Description
+SE(3) flow matching for conditional RNA backbone generation.
 
-RNA-FrameFlow is a generative model for 3D RNA backbone design based on SE(3) flow matching. 
+当前仓库的训练与推理流程已经围绕“簇目录 + 预处理 `.pt` 文件 + 单体/成对 embedding 条件”重构。本文档只描述当前代码真实支持的工作流，不再保留早期基于原始 RNAsolo 流程的过时说明。
 
-![RNA-FrameFlow](assets/rna_flow_diag.png)
+## 当前代码做什么
 
-> Accompanying paper: ['RNA-FrameFlow: Flow Matching for de novo 3D RNA Backbone Design'](https://arxiv.org/abs/2406.13839), by Rishabh Anand*, Chaitanya K. Joshi*, Alex Morehead, Arian Rokkum Jamasb, Charles Harris, Simon V Mathis, Kieran Didi, Bryan Hooi, Pietro Liò.
-> - **Published** in Transactions on Machine Learning Research (TMLR), 2025: [`openreview`](https://openreview.net/forum?id=wOc1Yx5s09)
-> - **Oral** at Machine Learning for Computational Biology (MLCB), 2024 (UW, Seattle, Washington)
-> - **Oral** at ICML 2024 Structured Probabilistic Inference & Generative Modeling Workshop: [`openreview`](https://openreview.net/forum?id=Z74lflCKmF)
-> - **Spotlight** at ICML 2024 AI4Science Workshop: [`openreview`](https://openreview.net/forum?id=YzjHCdZM2h)
+核心训练入口和职责如下：
 
-## Pipeline
+- `train_se3_flows.py`: 读取 `configs/config.yaml`，实例化 `FlowModule(cfg)` 和 `RNAConformerDataModule(cfg.data_cfg)`，然后调用 Lightning `Trainer.fit(...)`。
+- `inference_se3_flows.py`: 读取 `configs/inference.yaml`，从 checkpoint 所在目录合并训练时保存的 `config.yaml`，按 `test_clusters.json` 过滤测试簇，然后调用 `Trainer.predict(...)` 采样并写出 PDB。
+- `rna_backbone_design/data/build_datasets.py`: 从簇目录中的 `structure/*.pdb` 离线构建预处理数据，输出每个 split 一个 `.pt` 文件。
+- `rna_backbone_design/data/rna_conformer_dataset.py`: 运行时读取单条 conformer 记录，并从磁盘加载 `*_single.npy` / `*_pair.npy` embedding。
+- `rna_backbone_design/data/rna_conformer_datamodule.py`: 构建 train/val/test dataloader，并在 `conformer_collate` 中把 batch pad 到同一长度。
+- `rna_backbone_design/models/flow_module.py`: 负责训练 loss、验证指标、采样和 checkpoint 恢复。
 
-![RNA-FrameFlow pipeline](assets/pipeline.png)
+## 环境安装
 
-## Contents
+当前 `pyproject.toml` 要求：
 
-- [RNA-FrameFlow: Flow Matching for de novo 3D RNA Backbone Design](#rna-frameflow-flow-matching-for-de-novo-3d-rna-backbone-design)
-  - [Description](#description)
-  - [Pipeline](#pipeline)
-  - [Contents](#contents)
-  - [Installation](#installation)
-  - [Data Preparation](#data-preparation)
-  - [Training and Inference](#training-and-inference)
-    - [Download weights](#download-weights)
-    - [Using your own retrained checkpoints](#using-your-own-retrained-checkpoints)
-    - [Run inference](#run-inference)
-    - [Run evaluation](#run-evaluation)
-      - [Running `EvalSuite`](#running-evalsuite)
-  - [Acknowledgements](#acknowledgements)
-  - [Citation](#citation)
-  
-## Installation
-To manage environments efficiently, we use [uv](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer). It simplifies managing dependencies and executing scripts.
+- Python `>=3.11,<3.12`
+- `uv` 作为推荐环境管理器
+- PyTorch 源默认指向 `cu126`
 
+最小安装流程：
 
 ```bash
-# clone repository
 git clone https://github.com/rish-16/rna-backbone-design.git
-cd rna-backbone-design/
-# create python environment
+cd rna-backbone-design
+
 pip install uv
 uv venv
-uv pip install hatchling
 uv sync
-uv add flash-attn --no-build-isolation
 ```
 
-> [!CAUTION]
-> Do take note of the compatibility between PyTorch and CUDA versions. We used `pytorch-cuda` v12.1 in the installation script but you should change this depending on your system's NVCC version. You can find the target version using `nvidia-smi` and looking for `CUDA Version`.
+如果你的机器不是 CUDA 12.6，需要先按你的环境调整 `pyproject.toml` 中的 `tool.uv.sources`。
 
-## Data Preparation
+训练默认使用 Weights & Biases 记录实验；若不想联网记录，可把 `configs/config.yaml` 中的 `experiment.wandb.mode` 改成 `offline`。
 
-Download RNASolo (3.48GB) containing the ~14K structures used to train our model at a resolution $\leq 4.0$ in the `.pdb` file format. In the project `rna-backbone-design` repository,
+## 数据目录约定
+
+当前代码假设 `data_cfg.data_dir` 指向按 cluster 组织的数据根目录。每个 cluster 至少包含：
+
+```text
+<data_dir>/
+  cluster_xxx/
+    structure/
+      *.pdb
+    embedding/
+      *_single.npy
+      *_pair.npy
+```
+
+其中：
+
+- `structure/*.pdb` 用于离线构建几何特征。
+- `embedding/*_single.npy` 和 `embedding/*_pair.npy` 会在训练/推理时动态加载。
+- 当前模型前向依赖 `single_embedding` 和 `pair_embedding`，这两类条件输入不能省略。
+
+默认配置位于 `configs/config.yaml`：
+
+```yaml
+data_cfg:
+  data_dir: /projects/u6bk/wanli/rna_ensemble_data
+  preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data
+```
+
+## 离线预处理
+
+`build_datasets.py` 会直接从 cluster 下的 PDB 文件生成五个预处理文件：
+
+- `train_conformers.pt`
+- `val_ensemble_conformers.pt`
+- `val_single_conformers.pt`
+- `test_ensemble_conformers.pt`
+- `test_single_conformers.pt`
+
+运行示例：
 
 ```bash
-# Download structures in PDB format from RNAsolo (31 October 2023 cutoff)
-mkdir -p data/rnasolo; cd data/rnasolo
-gdown 10NidhkkJ-rkbqDwBGA_GaXs9enEBJ7iQ
-tar -zxvf RNAsolo_31102023.tar.gz
+uv run -m rna_backbone_design.data.build_datasets \
+  --data_dir /projects/u6bk/wanli/rna_ensemble_data \
+  --output_dir /projects/u6bk/wanli/rna_ensemble_data/preprocessed_data \
+  --cluster_split /projects/u6bk/wanli/rna_ensemble_data/split_cdhit80.json \
+  --compute_rmsd
 ```
 
-<details>
-<summary>Older instructions to download RNAsolo (not working – ignore this)</summary>
-    
+如果不传 `--cluster_split`，脚本会默认使用 `<data_dir>/split_cdhit80.json`，必要时基于 CD-HIT 重新构建 split manifest。
+
+### `.pt` 文件内容
+
+每个 `.pt` 文件都是 `List[Dict]`，每个元素对应一个 conformer。当前记录至少包含：
+
+- `aatype`: `[L]`
+- `trans_1`: `[L, 3]`
+- `rotmats_1`: `[L, 3, 3]`
+- `torsion_angles_sin_cos`: `[L, 8, 2]`
+- `torsion_angles_mask`: `[L, 8]`
+- `res_mask`: `[L]`
+- `is_na_residue_mask`: `[L]`
+- `c4_coords`: `[L, 3]`
+- `bb_coords`: `[L, 3, 3]`
+- 元数据：`conformer_name`、`cluster_name`、`seq_len`、`embedding_dir`、`cluster_conformer_names`、`cluster_size`
+- 训练集可选字段：`rmsd_matrix`、`rmsd_names`
+
+embedding 不会写进 `.pt`，而是在 `RNAConformerDataset` 中从 `embedding_dir` 读取。
+
+## 运行时 batch 契约
+
+`conformer_collate` 会把样本 pad 到 batch 内最大长度，生成的 clean batch 关键字段为：
+
+- `aatype`: `[B, L]`
+- `res_mask`: `[B, L]`
+- `trans_1`: `[B, L, 3]`
+- `rotmats_1`: `[B, L, 3, 3]`
+- `torsion_angles_sin_cos`: `[B, L, 8, 2]`
+- `single_embedding`: `[B, L, C_single]`
+- `pair_embedding`: `[B, L, L, C_pair]`
+- `seq_len`: `[B]`
+
+默认配置下：
+
+- `C_single = 384`
+- `C_pair = 128`
+
+真正送入 `FlowModel.forward(...)` 之前，`Interpolant.corrupt_batch(...)` 还会补充：
+
+- `t`
+- `trans_t`: `[B, L, 3]`
+- `rotmats_t`: `[B, L, 3, 3]`
+- 可选 `trans_sc`: `[B, L, 3]`
+
+## 训练
+
+训练命令：
+
 ```bash
-# create data directory
-mkdir -p data/rnasolo; cd data/rnasolo
-# download RNAsolo
-wget https://rnasolo.cs.put.poznan.pl/media/files/zipped/bunches/pdb/all_member_pdb_4_0__3_326.zip
-unzip all_member_pdb_4_0__3_326.zip # unzips all PDB files
-mv all_member_pdb_4_0__3_326.zip ../ # moves ZIP archive out of new file directory
-```
-</details>
-
-We provide a preprocessing script `process_rna_pdb_files.py` that prepares the RNA samples used during training. Again, in the main project directory,
-```bash
-# from ./
-uv run process_rna_pdb_files.py --pdb_dir data/rnasolo/ --write_dir data/rnasolo_proc/
-```
-
-When you visit `data/rnasolo_proc/`, you should see a bunch of subdirectories representing the root of the PDB entry names. Each subdirectory contains pickled versions of the PDB files which capture some important structural descriptors extracted from the atomic records; this is for easier bookkeeping during training. You'll also notice a `rna_metadata.csv` file. Keep track of the filepath to this CSV file – it contains metadata about the pickled RNA files and the relative filepaths to access them during training.
-
-Your directory should now look like this:
-```
-.
-├── rna_backbone_design
-│   ├── analysis
-│   ├── data
-│   ├── experiments
-│   ├── models
-│   ├── openfold
-│   └── tools
-├── configs
-│   ├── base.yaml
-│   └── inference.yaml
-├── data
-│   ├── rnasolo
-│   └── rnasolo_proc
-│       └── rna_metadata.csv
-└── camera_ready_ckpts/
-```
-
-## Training and Inference
-
-> [!IMPORTANT]
-> Our training relies on logging with `wandb`. Log in to WandB and make an account. Authorize WandB [here](https://wandb.ai/authorize).
-
-We use 4 RTX3090 40GB GPUs via DDP to train our model for 120K steps, which took ~15 hours. We train on sequences of length between 40 and 150. For more specific experimental details, look at `configs/config.yaml`.
-
-```bash
-# run training
 uv run train_se3_flows.py
 ```
 
-### Train/validation split (CD-HIT)
+默认行为：
 
-Training now uses preprocessed conformer `.pt` files built by `rna_backbone_design/data/build_datasets.py` and loaded through `RNAConformerDataModule` under `data_cfg.preprocessed_dir`. The cluster split still comes from the manifest under `data_cfg.data_dir`, which is constructed by clustering cluster sequences with **CD-HIT (cd-hit-est)** at **80% identity** to reduce sequence leakage. A cached manifest (default: `split_cdhit80.json`) is written into the data directory the first time it is built.
+- 使用 `configs/config.yaml`。
+- 实验配置会被保存到 `experiment.checkpointer.dirpath/config.yaml`。
+- checkpoint 路径默认是：
 
-Validation is further separated into:
-- **ensemble validation**: clusters with **≥ 5** structures (used to compute `ens_*` metrics)
-- **single validation**: clusters with **≤ 4** structures (used to compute `rmsd_c4`)
+```yaml
+experiment:
+  checkpointer:
+    dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
+```
 
-After training, the final saved checkpoint can be found at `ckpt/se3-fm/rna-frameflow/last.ckpt` directory saved locally (not part of this repo); this `ckpt` directory is created automatically by `wandb`. We also store intermediate checkpoints for your reference. You can rename and shift this `last.ckpt` file where necessary to run inference.
+训练前至少检查这些配置项：
 
-Alternatively, you can use our camera-ready baseline checkpoint. The config files necessary can be found inside `camera_ready_ckpts/`.
+- `data_cfg.data_dir`: cluster 数据根目录
+- `data_cfg.preprocessed_dir`: 五个 `.pt` 文件所在目录
+- `experiment.wandb.project` / `experiment.wandb.name`
+- `experiment.trainer.accelerator` / `strategy`
+- `experiment.checkpointer.dirpath`
 
-> We provide a brief description of the different schemes to represent all-atom RNA molecules used throughout the codebase in `rna_backbone_design/DATA_REPR.md`. 
+当前默认配置还启用了：
 
-### Download weights
+- `val_ensemble_as_cluster: true`
+- `test_ensemble_as_cluster: true`
+- `experiment.ensemble_metrics.enabled: true`
 
-Our strongest baseline model's trained weights are hosted on Google Drive: [link](https://drive.google.com/drive/folders/1umg0hgkBl7zsF_2GdCIKkfsRWbJNEOvp?usp=sharing). Add it into the `camera_ready_ckpts/` subdirectory. If you are on a remote server, there are libraries like [`gdown`](https://github.com/wkentaro/gdown) that help you retrieve this directly from GDrive. You need to pass in the file ID `1AnDMUa6ZnaRQonQje3Sfo1KBSQAsNKXe`:
+这意味着 ensemble 验证/测试会按 cluster 聚合，而不是把每个 conformer 独立当作一个样本。
+
+## 推理
+
+推理命令：
 
 ```bash
-# download checkpoints
-cd camera_ready_ckpts/
-gdown 1AnDMUa6ZnaRQonQje3Sfo1KBSQAsNKXe
-```
-
-Your subdirectory should look like this now:
-
-```
-.
-└── camera_ready_ckpts/
-    ├── inference.yaml # for inference/sampling
-    ├── rna_frameflow_public_weights.ckpt # for inference / sampling / finetuning
-    └── config.yaml # for training
-```
-
-### Using your own retrained checkpoints
-
-If you've retrained RNA-FrameFlow from scratch, as mentioned above, your checkpoint can be found at `ckpts/se3-fm/rna-frameflow/last.ckpt`. After renaming and shifting this `last.ckpt` file where necessary, visit `configs/inference.yaml` and change the path in the inference YAML file:
-
-```
-inference:
-  ckpt_path: configs/<insert_ckpt_name>.ckpt # path to model checkpoint of interest
-```
-
-This ensures the correct model checkpoints are used to generate new samples.
-
-### Run inference
-
-By default we sample 50 sequences per length between 40 and 150. Generated all-atom RNA backbones are stored as PDB files in the `inference.output_dir` directory listed in the inference YAML file.
-
-```bash
-# run inference
 uv run inference_se3_flows.py
 ```
 
-Running inference also performs evaluation on the generated samples to compute local and global structural metrics. Inference together with evaluation takes around 2 hours on our hardware. See the subsequent section for setting up and running evaluation separately from inference.
+`configs/inference.yaml` 中最重要的字段：
 
-### Run evaluation
-
-![Evaluation pipeline](assets/evaluation.png)
-
-We provide an evaluation pipeline called [`EvalSuite`](https://github.com/rish-16/rna-backbone-design/blob/main/rna_backbone_design/analysis/evalsuite.py) that computes local and global structural metrics when pointed at a directory of our model's RNA backbone samples. We use [gRNAde](https://arxiv.org/abs/2305.14749) (Joshi et al., 2023) as our inverse folder and [RhoFold](https://arxiv.org/abs/2207.01586) (Shen et al., 2022) as the structure predictor. First, download the RhoFold checkpoints (we didn't include this because of its size):
-
-```bash
-cd rna_backbone_design/tools/rhofold_api/
-mkdir checkpoints
-cd checkpoints/
-wget https://proj.cse.cuhk.edu.hk/aihlab/RhoFold/api/download?filename=RhoFold_pretrained.pt -O RhoFold_pretrained.pt
+```yaml
+inference:
+  ckpt_path: /projects/u6bk/wanli/checkpoint/rnafm_ckpt/ensemble_flow_matching/last.ckpt
+  output_dir: /projects/u6bk/wanli/inference/rnafm_ensemble
+  test_clusters_json: /projects/u6bk/wanli/inference/test_clusters.json
+  test_cluster_split: test_ensemble
+  num_gpus: 4
 ```
 
-If the above URL does not work, we have stored the RhoFold checkpoints in a Google Drive for easier access:
+当前推理逻辑有几个关键点：
 
-> [https://drive.google.com/drive/folders/1umg0hgkBl7zsF_2GdCIKkfsRWbJNEOvp?usp=drive_link](https://drive.google.com/drive/folders/1umg0hgkBl7zsF_2GdCIKkfsRWbJNEOvp?usp=drive_link)
+- 如果 `inference.ckpt_path` 指向目录，该目录下必须且只能有一个 `.ckpt` 文件。
+- 推理会优先读取 checkpoint 同目录下的 `config.yaml`；如果不存在，则尝试 `config_flashipa.yaml`。
+- checkpoint 配置会与 `configs/inference.yaml` 合并，且 inference 配置优先生效。
+- `test_clusters_json` 中支持的 split 名称是：`all`、`both`、`test_single`、`single`、`test_ensemble`、`ensemble`。
+- 推理 dataloader 固定 `batch_size=1`，输出会写到 `inference.output_dir` 下。
 
-#### Running `EvalSuite`
+`test_clusters.json` 预期至少包含如下键中的一个或多个：
 
-Go back to the project's root directory. Here is a minimal example of `EvalSuite` in action. The API takes care of the computation, storage, and management of local structural measurements as well as global metrics (desigability, diversity, and novelty). Set-up instructions can be found in `inference_se3_flows.py`.
-
-```python
-from rna_backbone_design.analysis.evalsuite import EvalSuite
-
-rna_bb_samples_dir = "generated_rna_bb_samples/" # generated samples for each sequence length
-saving_dir = "rna_eval_metrics" # save temp files and metrics
-
-evalsuite = EvalSuite(
-              save_dir=saving_dir,
-              paths=cfg.inference.evalsuite.paths,
-              constants=cfg.inference.evalsuite.constants,
-              gpu_id1=0, # cuda:0 -> for inverse-folding model
-              gpu_id2=1,  # cuda:1 -> for forward-folding model
-            )
-
-# compute local structural measurements and 
-metric_dict = evalsuite.perform_eval(
-                            rna_bb_samples_dir,
-                            flatten_dir=True
-                        )
-
-evalsuite.print_metrics(metric_dict) # print eval metrics
-"""
-Diversity (#clusters / #designable): 0.55
-Novelty (pdbTM): 0.63
-Designability (% scTM >= 0.45) 0.457
-Designability (% scRMSD <= 4 ang): 0.433
-"""
+```json
+{
+  "test_single": ["cluster_..."],
+  "test_ensemble": ["cluster_..."]
+}
 ```
 
-## Acknowledgements
+## 当前目录流转
 
-This work is presented by Rishabh Anand to fulfill the Bachelor's Dissertation requirements at the Department of Computer Science, School of Computing, National University of Singapore (NUS). It is done in collaboration with Pietro Liò's group at the University of Cambridge, UK.
+一个最常见的数据流如下：
 
-Our codebase builds on the open-source contributions from the following projects:
-- [`protein-frame-flow`](https://github.com/microsoft/protein-frame-flow)
-- [`se3_diffusion`](https://github.com/jasonkyuyim/se3_diffusion)
-- [`MMDiff`](https://github.com/Profluent-Internships/MMDiff)
-- [`geometric-rna-design`](https://github.com/chaitjo/geometric-rna-design)
-
-## Citation
-
+```text
+cluster directories
+  -> build_datasets.py
+  -> preprocessed_data/*.pt
+  -> train_se3_flows.py
+  -> checkpoint dir/config.yaml + *.ckpt
+  -> inference_se3_flows.py
+  -> sampled PDBs under inference.output_dir
 ```
+
+## 常见约束
+
+- 当前训练和推理都默认依赖 `single_embedding` 与 `pair_embedding`。
+- 如果你修改数据 shape，需要联动更新：`build_datasets.py` -> `RNAConformerDataset` -> `conformer_collate` -> `Interpolant` / `FlowModule`。
+- 验证和测试阶段会过滤名称形如 `msa_group_*` / `msa_*` 的 conformer。
+- `train` split 在 `posterior_nearest_p > 0` 时会额外加载邻居 conformer 的几何信息。
+
+## 论文与引用
+
+论文信息：
+
+- arXiv: <https://arxiv.org/abs/2406.13839>
+- TMLR: <https://openreview.net/forum?id=wOc1Yx5s09>
+
+```bibtex
 @article{anand2025rnaframeflow,
   title={{RNA}-FrameFlow: Flow Matching for de novo 3D {RNA} Backbone Design},
   author={Rishabh Anand and Chaitanya K. Joshi and Alex Morehead and Arian Rokkum Jamasb and Charles Harris and Simon V Mathis and Kieran Didi and Rex Ying and Bryan Hooi and Pietro Lio},

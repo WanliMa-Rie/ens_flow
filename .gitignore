@@ -2,8 +2,7 @@
 data/**
 rebuttals/**
 rna_backbone_design/tools/rhofold_api/checkpoints/RhoFold_pretrained.pt
-configs/*.ckpt
-camera_ready_ckpts/*.ckpt
+configs/*.yaml
 ckpt_local/
 data_ensemble/**
 metadata/**
@@ -12,6 +11,8 @@ configs/*.yaml
 generated_rna_bb_samples/**
 rna_ensemble_data.tar.gz
 logs/**
+AGENTS.md
+.vscode/**
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files
