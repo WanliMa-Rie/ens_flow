@@ -293,6 +293,13 @@ def gdt_score(
     scores = torch.stack(scores, dim=-1)
     return scores.mean(dim=-1)  # Average over thresholds
 
+
+def single_metrics_calc(gt_atoms: Tensor, pred_atoms: Tensor, mask: Tensor) -> dict[str, Tensor]:
+    mask_bool = mask.bool()
+    num_batch = gt_atoms.shape[0]
+    
+
+
 def calc_rna_c4_c4_metrics(c4_pos, bond_tol=0.1, clash_tol=1.0):
     '''
     Compute the following metrics:

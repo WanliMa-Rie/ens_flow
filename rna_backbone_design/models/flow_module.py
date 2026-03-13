@@ -263,6 +263,60 @@ class FlowModule(LightningModule):
             "torsion_loss": tors_loss,
         }
 
+    def noise_val_batch(self, batch):
+        self.interpolant.set_device(batch["res_mask"].device)
+        noisy_batch = self.interpolant.corrupt_batch(batch)
+
+        if self._interpolant_cfg.self_condition and random.random() > 0.5:
+            with torch.no_grad():
+                model_sc = self.model(noisy_batch)
+                noisy_batch["trans_sc"] = model_sc["pred_trans"]
+        return noisy_batch
+    
+    def single_metric_calc(self, batch, noisy_batch):
+        res_mask = batch['res_mask']
+        mask_bool = res_mask > 0.5
+        num_batch, num_res = res_mask.shape
+        
+        with torch.no_grad():
+            model_out = self.model(noisy_batch)
+
+        torsions_start_index = 0
+        torsions_end_index = 8
+        num_torsions = torsions_end_index - torsions_start_index
+
+        gt_trans_1 = batch["trans_1"]
+        gt_rotmats_1 = batch["rotmats_1"]
+        gt_torsions_1 = batch["torsion_angles_sin_cos"][
+            :, :, torsions_start_index:torsions_end_index, :
+        ].reshape(num_batch, num_res, num_torsions * 2)
+
+        pred_trans_1 = model_out["pred_trans"]
+        pred_rotmats_1 = model_out["pred_rotmats"]
+        pred_torsions_1 = model_out["pred_torsions"].reshape(
+            num_batch, num_res, num_torsions * 2
+        )
+
+        is_na_residue_mask = batch["is_na_residue_mask"].bool()
+        c4_idx = nucleotide_constants.atom_order["C4'"]
+
+        gt_atoms = rna_all_atom.to_atom37_rna(
+            gt_trans_1,
+            gt_rotmats_1,
+            is_na_residue_mask,
+            torsions=gt_torsions_1,
+        )
+
+        pred_atoms = rna_all_atom.to_atom37_rna(
+            pred_trans_1,
+            pred_rotmats_1,
+            is_na_residue_mask,
+            torsions=pred_torsions_1,
+        )
+
+        gt_c4 = gt_atoms[:, :, c4_idx]
+        pred_c4 = pred_atoms[:, :, c4_idx]
+
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         self.interpolant.set_device(batch["res_mask"].device)
         loader_name = "ensemble" if int(dataloader_idx) == 0 else "single"
