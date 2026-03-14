@@ -79,11 +79,8 @@ experiment:
     aux_loss_t_pass: 0.25
     tors_loss_scale: 1.0
     num_non_frame_atoms: 0 # choose from [0, 3, 7]
-  ensemble_metrics:
-    enabled: true
+  validation:
     num_generated: 150
-    num_gt: 16
-    max_batches: 1
   wandb:
     name: baseline
     project: velmix

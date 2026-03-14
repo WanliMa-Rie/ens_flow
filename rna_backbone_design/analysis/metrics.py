@@ -9,6 +9,7 @@ from loguru import logger
 from torch import Tensor
 
 from rna_backbone_design.data import nucleotide_constants
+from rna_backbone_design.data import all_atom as rna_all_atom
 
 def exists(x: object) -> bool:
     return x is not None
@@ -294,10 +295,33 @@ def gdt_score(
     return scores.mean(dim=-1)  # Average over thresholds
 
 
-def single_metrics_calc(gt_atoms: Tensor, pred_atoms: Tensor, mask: Tensor) -> dict[str, Tensor]:
-    mask_bool = mask.bool()
-    num_batch = gt_atoms.shape[0]
-    
+
+def compute_single_metrics(pred_c4_i, gt_c4_i, mask_i):
+    """
+    pred_c4_i: [G, L, 3]
+    gt_c4_i: [1, L, 3]
+    mask_i: [1, L]
+    """
+
+    num_generated = pred_c4_i.shape[0]
+    rmsd_list = torch.full((num_generated, ), float("nan"), dtype=pred_c4_i.dtype, device=pred_c4_i.device)
+    tm_list = torch.full_like(rmsd_list, float("nan"))
+    for j in range(num_generated):
+        pred_c4_j = pred_c4_i[j : j + 1]
+        try:
+            pred_c4_aligned = superimpose(gt_c4_i, pred_c4_j, mask_i)
+        except RuntimeError:
+            pred_c4_aligned = pred_c4_j
+
+        rmsd_j = rmsd(gt_c4_i, pred_c4_aligned, mask=mask_i)
+        tm_j = tm_score(gt_c4_i, pred_c4_aligned, mask=mask_i, apply_superimpose=False)
+        rmsd_list[j] = rmsd_j.squeeze(0)
+        tm_list[j] = tm_j.squeeze(0)
+
+    best_rmsd = torch.nanmin(rmsd_list)
+    best_tm_score = torch.nanmax(tm_list)
+    return {"rmsd": best_rmsd, "tm_score": best_tm_score}
+
 
 
 def calc_rna_c4_c4_metrics(c4_pos, bond_tol=0.1, clash_tol=1.0):

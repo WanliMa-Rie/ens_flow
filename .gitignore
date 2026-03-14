@@ -13,6 +13,7 @@ rna_ensemble_data.tar.gz
 logs/**
 AGENTS.md
 .vscode/**
+core
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files

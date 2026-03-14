@@ -34,6 +34,7 @@ class FlowModule(LightningModule):
         super().__init__()
         self._print_logger = logging.getLogger(__name__)
         self._exp_cfg = cfg.experiment
+        self._validation = self._exp_cfg.validation
         self._model_cfg = cfg.model
         self._interpolant_cfg = cfg.interpolant
 
@@ -273,122 +274,74 @@ class FlowModule(LightningModule):
                 noisy_batch["trans_sc"] = model_sc["pred_trans"]
         return noisy_batch
     
-    def single_metric_calc(self, batch, noisy_batch):
-        res_mask = batch['res_mask']
-        mask_bool = res_mask > 0.5
-        num_batch, num_res = res_mask.shape
-        
-        with torch.no_grad():
-            model_out = self.model(noisy_batch)
-
-        torsions_start_index = 0
-        torsions_end_index = 8
-        num_torsions = torsions_end_index - torsions_start_index
-
-        gt_trans_1 = batch["trans_1"]
-        gt_rotmats_1 = batch["rotmats_1"]
-        gt_torsions_1 = batch["torsion_angles_sin_cos"][
-            :, :, torsions_start_index:torsions_end_index, :
-        ].reshape(num_batch, num_res, num_torsions * 2)
-
-        pred_trans_1 = model_out["pred_trans"]
-        pred_rotmats_1 = model_out["pred_rotmats"]
-        pred_torsions_1 = model_out["pred_torsions"].reshape(
-            num_batch, num_res, num_torsions * 2
-        )
-
-        is_na_residue_mask = batch["is_na_residue_mask"].bool()
-        c4_idx = nucleotide_constants.atom_order["C4'"]
-
-        gt_atoms = rna_all_atom.to_atom37_rna(
-            gt_trans_1,
-            gt_rotmats_1,
-            is_na_residue_mask,
-            torsions=gt_torsions_1,
-        )
-
-        pred_atoms = rna_all_atom.to_atom37_rna(
-            pred_trans_1,
-            pred_rotmats_1,
-            is_na_residue_mask,
-            torsions=pred_torsions_1,
-        )
-
-        gt_c4 = gt_atoms[:, :, c4_idx]
-        pred_c4 = pred_atoms[:, :, c4_idx]
 
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         self.interpolant.set_device(batch["res_mask"].device)
         loader_name = "ensemble" if int(dataloader_idx) == 0 else "single"
+
         res_mask = batch["res_mask"]
         mask_bool = res_mask > 0.5
         num_batch, num_res = res_mask.shape
+        num_generated = getattr(self._validation, "num_generated", 0)
 
-        noisy_batch = self.interpolant.corrupt_batch(batch)
-        if self._interpolant_cfg.self_condition and random.random() > 0.5:
-            with torch.no_grad():
-                model_sc = self.model(noisy_batch)
-                noisy_batch["trans_sc"] = model_sc["pred_trans"]
-
-        batch_losses = self.model_step(noisy_batch)
-        total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
-        val_loss = total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
-
-        self._log_scalar(
-            f"valid/{loader_name}_loss",
-            val_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-            batch_size=num_batch,
-        )
-
-        with torch.no_grad():
-            model_out = self.model(noisy_batch)
-
-        torsions_start_index = 0
-        torsions_end_index = 8
-        num_torsions = torsions_end_index - torsions_start_index
-
-        gt_trans_1 = batch["trans_1"]
-        gt_rotmats_1 = batch["rotmats_1"]
-        gt_torsions_1 = batch["torsion_angles_sin_cos"][
-            :, :, torsions_start_index:torsions_end_index, :
-        ].reshape(num_batch, num_res, num_torsions * 2)
-
-        pred_trans_1 = model_out["pred_trans"]
-        pred_rotmats_1 = model_out["pred_rotmats"]
-        pred_torsions_1 = model_out["pred_torsions"].reshape(
-            num_batch, num_res, num_torsions * 2
-        )
-
-        is_na_residue_mask = torch.ones_like(res_mask, dtype=torch.bool)
-        gt_atoms = rna_all_atom.to_atom37_rna(
-            gt_trans_1, gt_rotmats_1, is_na_residue_mask, torsions=gt_torsions_1
-        )
-        pred_atoms = rna_all_atom.to_atom37_rna(
-            pred_trans_1,
-            pred_rotmats_1,
-            is_na_residue_mask,
-            torsions=pred_torsions_1,
-        )
-
+        gt_c4 = batch["c4_coords"]
         c4_idx = nucleotide_constants.atom_order["C4'"]
-        gt_c4 = gt_atoms[:, :, c4_idx]
-        pred_c4 = pred_atoms[:, :, c4_idx]
 
-        valid_align = mask_bool.sum(dim=1) >= 3
-        aligned_pred_c4 = pred_c4
-        if valid_align.any():
-            idx = torch.nonzero(valid_align, as_tuple=False).squeeze(-1)
-            try:
-                aligned_subset = metrics.superimpose(
-                    gt_c4[idx], pred_c4[idx], mask=mask_bool[idx]
-                )
-                aligned_pred_c4 = pred_c4.clone()
-                aligned_pred_c4[idx] = aligned_subset
-            except RuntimeError:
-                aligned_pred_c4 = pred_c4
+        # Single metrics: RMSD and TM-score on C4' atoms
+        if loader_name == "single":
+            batch_metrics = []
+            for i in range(num_batch):
+                length = int(mask_bool[i].sum().item())
+                sample_metrics = {"rmsd": float("nan"), "tm_score": float("nan")}
+
+                single_embedding = batch["single_embedding"][i:i+1, :length].repeat(num_generated, 1, 1)
+                pair_embedding = batch["pair_embedding"][i:i+1, :length, :length].repeat(num_generated, 1, 1, 1)
+                context = {
+                    "single_embedding": single_embedding,
+                    "pair_embedding": pair_embedding
+                }
+
+                samples = self.interpolant.sample(num_generated, length, self.model, context=context)[0][-1]
+                pred_c4_i = samples[:, :length, c4_idx]
+                gt_c4_i = gt_c4[i :i+1, :length].detach().cpu()
+                mask_i = mask_bool[i :i+1, :length].detach().cpu()
+
+                # Compute metrics
+                single_metrics = metrics.compute_single_metrics(pred_c4_i, gt_c4_i, mask_i)
+                sample_metrics["rmsd"] = single_metrics["rmsd"]
+                sample_metrics["tm_score"] = single_metrics["tm_score"]
+            batch_metrics.append(sample_metrics)
+
+        # Ensemble metrics: pairwise RMSD, AMR-R, AMR-P, COV-R, COV-P on C4' atoms
+        elif loader_name == "ensemble":
+            batch_metrics = []
+            gt_ens_list = batch["gt_c4_ensemble"]
+            for i in range(num_batch):
+                length = int(mask_bool[i].sum().item())
+                sample_metrics = {
+                    "ens_pairwise_rmsd": float("nan"),
+                    "cov_r": float("nan"),
+                    "cov_p": float("nan"),
+                    "amr_r": float("nan"),
+                    "amr_p": float("nan"),
+                }
+
+                single_embedding = batch["single_embedding"][i:i+1, :length].repeat(num_generated, 1, 1)
+                pair_embedding = batch["pair_embedding"][i:i+1, :length, :length].repeat(num_generated, 1, 1, 1)
+                context = {
+                    "single_embedding": single_embedding,
+                    "pair_embedding": pair_embedding
+                }
+
+                samples = self.interpolant.sample(num_generated, length, self.model, context=context)[0][-1]
+                pred_c4 = samples[:, :length, c4_idx]
+                gt_ens = gt_ens_list[i]
+
+                valid_length = min(length, int(gt_ens.shape[1]))
+                
+                
+
+
 
         ensemble_cfg = getattr(self._exp_cfg, "ensemble_metrics", None)
         compute_ensemble = False
@@ -401,12 +354,6 @@ class FlowModule(LightningModule):
             num_generated = int(getattr(ensemble_cfg, "num_generated", 0))
             num_gt = int(getattr(ensemble_cfg, "num_gt", 0))
 
-        rmsd_c4 = None
-        if loader_name == "single":
-            rmsd_c4 = metrics.rmsd(gt_c4, aligned_pred_c4, mask=mask_bool.float())
-            rmsd_c4 = torch.where(
-                valid_align, rmsd_c4, torch.full_like(rmsd_c4, torch.nan)
-            )
 
         batch_metrics = []
         mask_np = mask_bool.detach().cpu().numpy()
@@ -414,9 +361,6 @@ class FlowModule(LightningModule):
             valid_len = int(mask_np[i].sum())
             c4_metrics = {}
 
-            if loader_name == "single":
-                assert rmsd_c4 is not None
-                c4_metrics["rmsd_c4"] = float(rmsd_c4.detach().cpu().numpy()[i])
 
             gt_ens_list = batch.get("gt_c4_ensemble", None)
             gt_ens = None

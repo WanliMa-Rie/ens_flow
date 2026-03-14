@@ -316,28 +316,13 @@ class RNAConformerDataset(Dataset):
         min_len = seq_len
         for j in indices:
             rec = self.records[j]
-            bb_len = int(rec["bb_coords"].shape[0])
-            c4_len = int(rec["c4_coords"].shape[0])
-            conf_len = min(bb_len, c4_len)
-            if conf_len <= 0:
-                continue
             conformer_records.append(rec)
             conformer_names.append(str(rec["conformer_name"]))
-            min_len = min(min_len, conf_len)
 
-        if not conformer_records:
-            raise ValueError(
-                f"Cluster '{cluster_name}' has no valid conformers for ensemble assembly."
-            )
-
-        bb_ensemble = [
-            rec["bb_coords"][:min_len].reshape(min_len * 3, 3) for rec in conformer_records
-        ]
         c4_ensemble = [rec["c4_coords"][:min_len] for rec in conformer_records]
 
         anchor["cluster_name"] = cluster_name
         anchor["cluster_conformer_names"] = conformer_names
         anchor["cluster_size"] = len(conformer_records)
-        anchor["gt_bb_ensemble"] = torch.stack(bb_ensemble, dim=0)
         anchor["gt_c4_ensemble"] = torch.stack(c4_ensemble, dim=0)
         return anchor
