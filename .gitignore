@@ -2,7 +2,6 @@
 data/**
 rebuttals/**
 rna_backbone_design/tools/rhofold_api/checkpoints/RhoFold_pretrained.pt
-configs/**
 ckpt_local/
 data_ensemble/**
 metadata/**
