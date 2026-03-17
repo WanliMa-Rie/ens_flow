@@ -32,14 +32,15 @@ def get_pdb_features(pdb_path: str, verbose: bool = False) -> Optional[Dict[str,
         structure = parser.get_structure("structure", pdb_path)
 
         # Extract all chains
-        struct_chains = {chain.id.upper(): chain for chain in structure.get_chains()}
+        struct_chains = list(structure.get_chains())
 
         struct_feats = []
         chain_idx = 0
 
-        for chain_id, chain in struct_chains.items():
+        for chain in struct_chains:
+            chain_id = str(chain.id)
             # Convert chain id into int
-            chain_index = utils.chain_str_to_int(chain_id)
+            chain_index = utils.chain_str_to_int(chain_id.upper())
             chain_mol = parsers.process_chain_pdb(
                 chain, chain_index, chain_id, verbose=verbose
             )

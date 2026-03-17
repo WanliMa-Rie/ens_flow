@@ -9,6 +9,14 @@ from rna_backbone_design.analysis import metrics
 
 
 def _pairwise_rmsd_matrix(coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the pairwise RMSD matrix for a set of conformations.
+    Args:
+        coords: [K, L, 3] tensor of coordinates for K conformations and L residues.
+        mask: [L] boolean tensor indicating which residues to include in RMSD calculation.
+    Returns:
+        [K, K] tensor of pairwise RMSD values.
+    """
 
     k = int(coords.shape[0])
 

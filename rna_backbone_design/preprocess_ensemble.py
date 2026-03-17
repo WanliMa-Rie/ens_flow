@@ -85,7 +85,7 @@ def process_file(
     structure = parser.get_structure(pdb_name, file_path)
 
     # Extract all chains
-    struct_chains = {chain.id.upper(): chain for chain in structure.get_chains()}
+    struct_chains = list(structure.get_chains())
     metadata["num_chains"] = len(struct_chains)
 
     # Extract features
@@ -95,9 +95,10 @@ def process_file(
 
     na_natype, chain_dict = None, None
 
-    for chain_id, chain in struct_chains.items():
+    for chain in struct_chains:
+        chain_id = str(chain.id)
         # Convert chain id into int
-        chain_index = utils.chain_str_to_int(chain_id)
+        chain_index = utils.chain_str_to_int(chain_id.upper())
         chain_mol = parsers.process_chain_pdb(
             chain, chain_index, chain_id, verbose=verbose
         )

@@ -13,6 +13,8 @@ logs/**
 AGENTS.md
 .vscode/**
 core
+tests/**
+scripts/**
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files
