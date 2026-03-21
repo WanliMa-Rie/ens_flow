@@ -318,8 +318,9 @@ def compute_single_metrics(pred_c4_i, gt_c4_i, mask_i):
         rmsd_list[j] = rmsd_j.squeeze(0)
         tm_list[j] = tm_j.squeeze(0)
 
-    best_rmsd = torch.nanmin(rmsd_list)
-    best_tm_score = torch.nanmax(tm_list)
+    valid = ~torch.isnan(rmsd_list)
+    best_rmsd = rmsd_list[valid].min() if valid.any() else rmsd_list[0]
+    best_tm_score = tm_list[valid].max() if valid.any() else tm_list[0]
     return {"rmsd": best_rmsd, "tm_score": best_tm_score}
 
 

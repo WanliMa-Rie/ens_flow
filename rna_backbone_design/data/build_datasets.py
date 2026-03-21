@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from Bio import PDB
+from Bio.PDB import MMCIFParser
 from tqdm import tqdm
 
 from rna_backbone_design.data import data_transforms
@@ -74,8 +75,8 @@ def pdb_to_complex_feats(
 
     Returns None if the file cannot be parsed.
     """
-    pdb_name = os.path.basename(pdb_path).replace(".pdb", "")
-    bio_parser = PDB.PDBParser(QUIET=True)
+    pdb_name = pathlib.Path(pdb_path).stem
+    bio_parser = MMCIFParser(QUIET=True)
 
     structure = bio_parser.get_structure(pdb_name, pdb_path)
     struct_chains = list(structure.get_chains())
@@ -253,7 +254,7 @@ def process_conformers(
     split_name: str,
     do_rmsd: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
-    pdb_files = sorted((cluster_dir / "structure").glob("*.pdb"))
+    pdb_files = sorted((cluster_dir / "structure").glob("*.cif"))
     if not pdb_files:
         return None
 

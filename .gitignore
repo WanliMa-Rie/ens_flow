@@ -13,7 +13,7 @@ logs/**
 AGENTS.md
 .vscode/**
 core
-tests/**
+tests/
 scripts/**
 
 rna_backbone_design/data/tests/**

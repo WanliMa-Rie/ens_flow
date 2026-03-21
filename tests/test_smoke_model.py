@@ -81,6 +81,10 @@ def _make_cfg():
                     "tors_loss_scale": 1.0,
                     "num_non_frame_atoms": 0,
                 },
+                "validation": {
+                    "num_generated": 2,
+                    "ensemble": {"max_batches": 2, "num_gt": 2},
+                },
                 "optimizer": {"lr": 1e-4},
                 "batch_ot": {
                     "enabled": False,
@@ -107,6 +111,8 @@ def _make_batch(B: int = 2, L: int = 8):
     single_embedding = torch.randn(B, L, 16, dtype=torch.float32)
     pair_embedding = torch.randn(B, L, L, 8, dtype=torch.float32)
 
+    c4_coords = torch.randn(B, L, 3, dtype=torch.float32)
+
     return {
         "aatype": torch.zeros(B, L, dtype=torch.long),
         "res_mask": res_mask,
@@ -117,6 +123,7 @@ def _make_batch(B: int = 2, L: int = 8):
         "torsion_angles_mask": tors_mask,
         "single_embedding": single_embedding,
         "pair_embedding": pair_embedding,
+        "c4_coords": c4_coords,
         "pdb_name": ["smoke_a", "smoke_b"],
     }
 
@@ -132,3 +139,42 @@ def test_flowmodule_model_step_smoke():
     assert "auxiliary_loss" in losses
     for v in losses.values():
         assert torch.isfinite(v).all()
+
+
+def test_flowmodule_validation_step_smoke():
+    cfg = _make_cfg()
+    module = FlowModule(cfg)
+    module.eval()
+
+    B, L = 2, 8
+
+    # --- single loader (dataloader_idx=1) ---
+    batch_single = _make_batch(B, L)
+    with torch.no_grad():
+        module.validation_step(batch_single, batch_idx=0, dataloader_idx=1)
+
+    single_dfs = module.validation_epoch_metrics_by_loader["single"]
+    assert len(single_dfs) == 1
+    df = single_dfs[0]
+    assert len(df) == B
+    assert "rmsd" in df.columns
+    assert "tm_score" in df.columns
+
+    # --- ensemble loader (dataloader_idx=0) ---
+    batch_ens = _make_batch(B, L)
+    # Provide gt_c4_ensemble: list of [K, L, 3] tensors per sample
+    num_gt = 2
+    batch_ens["gt_c4_ensemble"] = [
+        torch.randn(num_gt, L, 3) for _ in range(B)
+    ]
+    with torch.no_grad():
+        module.validation_step(batch_ens, batch_idx=0, dataloader_idx=0)
+
+    ens_dfs = module.validation_epoch_metrics_by_loader["ensemble"]
+    assert len(ens_dfs) == 1
+    df_ens = ens_dfs[0]
+    assert len(df_ens) == B
+    assert "ens_pairwise_rmsd" in df_ens.columns
+
+    # --- on_validation_epoch_end should not crash ---
+    module.on_validation_epoch_end()

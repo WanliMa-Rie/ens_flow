@@ -81,6 +81,9 @@ experiment:
     num_non_frame_atoms: 0 # choose from [0, 3, 7]
   validation:
     num_generated: 150
+    ensemble:
+      max_batches: 5
+      num_gt: 20
   wandb:
     name: baseline
     project: velmix

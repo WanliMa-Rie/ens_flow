@@ -264,17 +264,6 @@ class FlowModule(LightningModule):
             "torsion_loss": tors_loss,
         }
 
-    def noise_val_batch(self, batch):
-        self.interpolant.set_device(batch["res_mask"].device)
-        noisy_batch = self.interpolant.corrupt_batch(batch)
-
-        if self._interpolant_cfg.self_condition and random.random() > 0.5:
-            with torch.no_grad():
-                model_sc = self.model(noisy_batch)
-                noisy_batch["trans_sc"] = model_sc["pred_trans"]
-        return noisy_batch
-    
-
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         self.interpolant.set_device(batch["res_mask"].device)
         loader_name = "ensemble" if int(dataloader_idx) == 0 else "single"
@@ -282,126 +271,62 @@ class FlowModule(LightningModule):
         res_mask = batch["res_mask"]
         mask_bool = res_mask > 0.5
         num_batch, num_res = res_mask.shape
-        num_generated = getattr(self._validation, "num_generated", 0)
-
-        gt_c4 = batch["c4_coords"]
+        num_generated = int(getattr(self._validation, "num_generated", 10))
         c4_idx = nucleotide_constants.atom_order["C4'"]
 
-        # Single metrics: RMSD and TM-score on C4' atoms
-        if loader_name == "single":
-            batch_metrics = []
-            for i in range(num_batch):
-                length = int(mask_bool[i].sum().item())
-                sample_metrics = {"rmsd": float("nan"), "tm_score": float("nan")}
-
-                single_embedding = batch["single_embedding"][i:i+1, :length].repeat(num_generated, 1, 1)
-                pair_embedding = batch["pair_embedding"][i:i+1, :length, :length].repeat(num_generated, 1, 1, 1)
-                context = {
-                    "single_embedding": single_embedding,
-                    "pair_embedding": pair_embedding
-                }
-
-                samples = self.interpolant.sample(num_generated, length, self.model, context=context)[0][-1]
-                pred_c4_i = samples[:, :length, c4_idx]
-                gt_c4_i = gt_c4[i :i+1, :length].detach().cpu()
-                mask_i = mask_bool[i :i+1, :length].detach().cpu()
-
-                # Compute metrics
-                single_metrics = metrics.compute_single_metrics(pred_c4_i, gt_c4_i, mask_i)
-                sample_metrics["rmsd"] = single_metrics["rmsd"]
-                sample_metrics["tm_score"] = single_metrics["tm_score"]
-            batch_metrics.append(sample_metrics)
-
-        # Ensemble metrics: pairwise RMSD, AMR-R, AMR-P, COV-R, COV-P on C4' atoms
-        elif loader_name == "ensemble":
-            batch_metrics = []
-            gt_ens_list = batch["gt_c4_ensemble"]
-            for i in range(num_batch):
-                length = int(mask_bool[i].sum().item())
-                sample_metrics = {
-                    "ens_pairwise_rmsd": float("nan"),
-                    "cov_r": float("nan"),
-                    "cov_p": float("nan"),
-                    "amr_r": float("nan"),
-                    "amr_p": float("nan"),
-                }
-
-                single_embedding = batch["single_embedding"][i:i+1, :length].repeat(num_generated, 1, 1)
-                pair_embedding = batch["pair_embedding"][i:i+1, :length, :length].repeat(num_generated, 1, 1, 1)
-                context = {
-                    "single_embedding": single_embedding,
-                    "pair_embedding": pair_embedding
-                }
-
-                samples = self.interpolant.sample(num_generated, length, self.model, context=context)[0][-1]
-                pred_c4 = samples[:, :length, c4_idx]
-                gt_ens = gt_ens_list[i]
-
-                valid_length = min(length, int(gt_ens.shape[1]))
-                
-                
-
-
-
-        ensemble_cfg = getattr(self._exp_cfg, "ensemble_metrics", None)
-        compute_ensemble = False
-        max_batches = 0
-        num_generated = 0
-        num_gt = 0
-        if ensemble_cfg is not None:
-            compute_ensemble = bool(getattr(ensemble_cfg, "enabled", False))
-            max_batches = int(getattr(ensemble_cfg, "max_batches", 0))
-            num_generated = int(getattr(ensemble_cfg, "num_generated", 0))
-            num_gt = int(getattr(ensemble_cfg, "num_gt", 0))
-
+        # Ensemble-specific config
+        ens_cfg = getattr(self._validation, "ensemble", None)
+        ens_max_batches = int(getattr(ens_cfg, "max_batches", 999)) if ens_cfg else 999
+        ens_num_gt = int(getattr(ens_cfg, "num_gt", 20)) if ens_cfg else 20
 
         batch_metrics = []
-        mask_np = mask_bool.detach().cpu().numpy()
+
         for i in range(num_batch):
-            valid_len = int(mask_np[i].sum())
-            c4_metrics = {}
+            length = int(mask_bool[i].sum().item())
+            if length < 3:
+                batch_metrics.append({})
+                continue
 
+            # Build conditioning context
+            context = {
+                "single_embedding": batch["single_embedding"][i:i+1, :length].repeat(num_generated, 1, 1),
+                "pair_embedding": batch["pair_embedding"][i:i+1, :length, :length].repeat(num_generated, 1, 1, 1),
+            }
 
-            gt_ens_list = batch.get("gt_c4_ensemble", None)
-            gt_ens = None
-            if isinstance(gt_ens_list, list):
-                gt_ens = gt_ens_list[i]
+            # Generate samples
+            atom37_traj, _, _ = self.interpolant.sample(
+                num_generated, length, self.model, context=context
+            )
+            pred_c4 = atom37_traj[-1][:, :length, c4_idx]  # [num_generated, length, 3]
 
-            if (
-                loader_name == "ensemble"
-                and compute_ensemble
-                and batch_idx < max_batches
-                and gt_ens is not None
-                and isinstance(gt_ens, torch.Tensor)
-            ):
-                eff_len = min(valid_len, int(gt_ens.shape[1]))
-                k_gt = min(num_gt, int(gt_ens.shape[0]), num_generated)
-                if eff_len >= 3 and k_gt >= 2 and num_generated >= 2:
-                    context = {
-                        "single_embedding": batch["single_embedding"][
-                            i : i + 1, :eff_len
-                        ].repeat(num_generated, 1, 1),
-                        "pair_embedding": batch["pair_embedding"][
-                            i : i + 1, :eff_len, :eff_len
-                        ].repeat(num_generated, 1, 1, 1),
-                    }
-                    atom37_traj, _, _ = self.interpolant.sample(
-                        num_generated, eff_len, self.model, context=context
-                    )
-                    pred_ens = atom37_traj[-1][:, :eff_len, c4_idx]
-                    gt_ens_i = gt_ens[:k_gt, :eff_len].to(pred_ens.device)
-                    pred_ens_i = pred_ens[:k_gt]
-                    m = mask_bool[i, :eff_len].to(pred_ens.device)
-                    ens = compute_ensemble_metrics(gt_ens_i, pred_ens_i, m)
-                    c4_metrics.update(
-                        {
-                            "ens_pairwise_rmsd": ens.pairwise_rmsd,
-                            "ens_w2": ens.w2_distance,
-                            "ens_pairwise_rmsd_r": ens.pairwise_rmsd_r,
-                        }
-                    )
+            sample_metrics = {}
 
-            batch_metrics.append(c4_metrics)
+            if loader_name == "single":
+                gt_c4_i = batch["c4_coords"][i:i+1, :length].detach().cpu()
+                mask_i = mask_bool[i:i+1, :length].detach().cpu()
+                single_result = metrics.compute_single_metrics(
+                    pred_c4.detach().cpu(), gt_c4_i, mask_i
+                )
+                sample_metrics["rmsd"] = float(single_result["rmsd"])
+                sample_metrics["tm_score"] = float(single_result["tm_score"])
+
+            elif loader_name == "ensemble" and batch_idx < ens_max_batches:
+                gt_ens_list = batch.get("gt_c4_ensemble", None)
+                gt_ens = gt_ens_list[i] if isinstance(gt_ens_list, list) else None
+
+                if gt_ens is not None and isinstance(gt_ens, torch.Tensor):
+                    eff_len = min(length, int(gt_ens.shape[1]))
+                    k = min(ens_num_gt, int(gt_ens.shape[0]), num_generated)
+                    if eff_len >= 3 and k >= 2:
+                        gt_ens_i = gt_ens[:k, :eff_len].to(pred_c4.device)
+                        pred_ens_i = pred_c4[:k, :eff_len]
+                        m = mask_bool[i, :eff_len].to(pred_c4.device)
+                        ens = compute_ensemble_metrics(gt_ens_i, pred_ens_i, m)
+                        sample_metrics["ens_pairwise_rmsd"] = ens.pairwise_rmsd
+                        sample_metrics["ens_w2"] = ens.w2_distance
+                        sample_metrics["ens_pairwise_rmsd_r"] = ens.pairwise_rmsd_r
+
+            batch_metrics.append(sample_metrics)
 
         self.validation_epoch_metrics_by_loader[loader_name].append(
             pd.DataFrame(batch_metrics)
