@@ -16,7 +16,6 @@ import logging
 from pytorch_lightning import LightningModule
 
 from rna_backbone_design.analysis import metrics
-from rna_backbone_design.analysis.ensemble_metrics import compute_ensemble_metrics
 from rna_backbone_design.analysis import utils as au
 from rna_backbone_design.models.flow_model import FlowModel
 from rna_backbone_design.models import utils as mu
@@ -265,66 +264,51 @@ class FlowModule(LightningModule):
         }
 
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        """
+        res_mask: [B, N]. residue mask, 0/1
+        is_na_residue_mask: [B, N]. nucletide/non-nucleotide residue mask, 0/1
+        num_res: int. number of nucletides in the sample (without padding)
+        """
+
+
         self.interpolant.set_device(batch["res_mask"].device)
         loader_name = "ensemble" if int(dataloader_idx) == 0 else "single"
 
-        res_mask = batch["res_mask"]
-        mask_bool = res_mask > 0.5
-        num_batch, num_res = res_mask.shape
+        num_batch = batch["is_na_residue_mask"].shape[0]
         num_generated = int(getattr(self._validation, "num_generated", 10))
         c4_idx = nucleotide_constants.atom_order["C4'"]
-
-        # Ensemble-specific config
-        ens_cfg = getattr(self._validation, "ensemble", None)
-        ens_max_batches = int(getattr(ens_cfg, "max_batches", 999)) if ens_cfg else 999
-        ens_num_gt = int(getattr(ens_cfg, "num_gt", 20)) if ens_cfg else 20
 
         batch_metrics = []
 
         for i in range(num_batch):
-            length = int(mask_bool[i].sum().item())
-            if length < 3:
-                batch_metrics.append({})
-                continue
+            sample = batch[i]
+            mask = sample["is_na_residue_mask"]
+            num_res = int(mask.sum().item())
 
-            # Build conditioning context
             context = {
-                "single_embedding": batch["single_embedding"][i:i+1, :length].repeat(num_generated, 1, 1),
-                "pair_embedding": batch["pair_embedding"][i:i+1, :length, :length].repeat(num_generated, 1, 1, 1),
+                "single_embedding": sample["single_embedding"].repeat(num_generated, 1, 1),
+                "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
             }
 
-            # Generate samples
             atom37_traj, _, _ = self.interpolant.sample(
-                num_generated, length, self.model, context=context
+                num_generated, num_res, self.model, context=context
             )
-            pred_c4 = atom37_traj[-1][:, :length, c4_idx]  # [num_generated, length, 3]
+            pred_c4 = atom37_traj[-1][:, :, c4_idx]
 
             sample_metrics = {}
 
             if loader_name == "single":
-                gt_c4_i = batch["c4_coords"][i:i+1, :length].detach().cpu()
-                mask_i = mask_bool[i:i+1, :length].detach().cpu()
+                gt_c4 = sample["c4_coords"]
                 single_result = metrics.compute_single_metrics(
-                    pred_c4.detach().cpu(), gt_c4_i, mask_i
+                    pred_c4, gt_c4, mask
                 )
-                sample_metrics["rmsd"] = float(single_result["rmsd"])
-                sample_metrics["tm_score"] = float(single_result["tm_score"])
+                sample_metrics["single_rmsd"] = float(single_result["rmsd"])
+                sample_metrics["single_tm_score"] = float(single_result["tm_score"])
 
-            elif loader_name == "ensemble" and batch_idx < ens_max_batches:
-                gt_ens_list = batch.get("gt_c4_ensemble", None)
-                gt_ens = gt_ens_list[i] if isinstance(gt_ens_list, list) else None
-
-                if gt_ens is not None and isinstance(gt_ens, torch.Tensor):
-                    eff_len = min(length, int(gt_ens.shape[1]))
-                    k = min(ens_num_gt, int(gt_ens.shape[0]), num_generated)
-                    if eff_len >= 3 and k >= 2:
-                        gt_ens_i = gt_ens[:k, :eff_len].to(pred_c4.device)
-                        pred_ens_i = pred_c4[:k, :eff_len]
-                        m = mask_bool[i, :eff_len].to(pred_c4.device)
-                        ens = compute_ensemble_metrics(gt_ens_i, pred_ens_i, m)
-                        sample_metrics["ens_pairwise_rmsd"] = ens.pairwise_rmsd
-                        sample_metrics["ens_w2"] = ens.w2_distance
-                        sample_metrics["ens_pairwise_rmsd_r"] = ens.pairwise_rmsd_r
+            elif loader_name == "ensemble":
+                gt_c4_ens = sample["gt_c4_ensemble"]
+                ensemble_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, mask)
+                sample_metrics.update(ensemble_result)
 
             batch_metrics.append(sample_metrics)
 
@@ -506,7 +490,7 @@ class FlowModule(LightningModule):
         interpolant.set_device(device)
 
         res_mask = batch["res_mask"]
-        num_batch = res_mask.shape[0]
+        num_batch, num_res = res_mask.shape
         mask_bool = res_mask > 0.5
 
         gt_trans_1 = batch["trans_1"]
@@ -544,22 +528,16 @@ class FlowModule(LightningModule):
             ensemble_write_pdbs = bool(getattr(ensemble_cfg, "write_ensemble_pdbs", False))
 
         for i in range(num_batch):
-            sample_length = int(res_mask[i].sum().item())
-            if sample_length < 1:
-                continue
-
             if isinstance(cluster_ids, (list, tuple)) and i < len(cluster_ids) and cluster_ids[i] is not None:
                 cluster_id = str(cluster_ids[i])
             else:
                 cluster_id = "unknown_cluster"
-            
+
             if ensemble_enabled:
-                # Save directly to cluster directory (e.g., /output_dir/cluster_0026/)
                 sample_dir = os.path.join(self._output_dir, cluster_id)
-                os.makedirs(sample_dir, exist_ok=True)
             else:
-                sample_dir = os.path.join(self._output_dir, cluster_id, f"length_{sample_length}")
-                os.makedirs(sample_dir, exist_ok=True)
+                sample_dir = os.path.join(self._output_dir, cluster_id, f"length_{num_res}")
+            os.makedirs(sample_dir, exist_ok=True)
 
             gt_ens_list = batch.get("gt_c4_ensemble", None)
             gt_ens = None
@@ -568,8 +546,8 @@ class FlowModule(LightningModule):
 
             num_generated = int(ensemble_num_generated) if ensemble_enabled else 1
             num_generated = max(1, num_generated)
-            context_single = batch["single_embedding"][i : i + 1, :sample_length]
-            context_pair = batch["pair_embedding"][i : i + 1, :sample_length, :sample_length]
+            context_single = batch["single_embedding"][i : i + 1]
+            context_pair = batch["pair_embedding"][i : i + 1]
             if num_generated > 1:
                 context = {
                     "single_embedding": context_single.repeat(num_generated, 1, 1),
@@ -582,7 +560,7 @@ class FlowModule(LightningModule):
                 }
 
             atom37_traj, _, _ = interpolant.sample(
-                num_generated, sample_length, self.model, context=context
+                num_generated, num_res, self.model, context=context
             )
 
             ens_metrics = None
@@ -593,12 +571,11 @@ class FlowModule(LightningModule):
                 and num_generated >= 2
                 and int(gt_ens.shape[0]) >= 2
             ):
-                eff_len = min(sample_length, int(gt_ens.shape[1]))
                 k = min(num_generated, int(gt_ens.shape[0]))
-                if eff_len >= 3 and k >= 2:
-                    pred_ens = atom37_traj[-1][:k, :eff_len, c4_idx]
-                    gt_ens_i = gt_ens[:k, :eff_len].to(pred_ens.device)
-                    m = mask_bool[i, :eff_len].to(pred_ens.device)
+                if k >= 2:
+                    pred_ens = atom37_traj[-1][:k, :, c4_idx]
+                    gt_ens_i = gt_ens[:k].to(pred_ens.device)
+                    m = mask_bool[i].to(pred_ens.device)
                     ens = compute_ensemble_metrics(gt_ens_i, pred_ens, m)
                     ens_metrics = {
                         "ens_pairwise_rmsd": ens.pairwise_rmsd,
@@ -610,30 +587,29 @@ class FlowModule(LightningModule):
                     }
 
             pdb_name = pdb_names[i] if isinstance(pdb_names, list) else None
-            is_na_residue_mask = np.ones(sample_length, dtype=np.int64)
-            gt_c4_i = gt_c4[i : i + 1, :sample_length]
-            mask_i = mask_bool[i : i + 1, :sample_length]
-            valid_align = bool(mask_i.sum().item() >= 3)
+            is_na_residue_mask = np.ones(num_res, dtype=np.int64)
+            gt_c4_i = gt_c4[i : i + 1]
+            mask = mask_bool[i : i + 1]
+            valid_align = bool(mask.sum().item() >= 3)
 
             for j in range(num_generated):
                 sample_name = f"{cluster_id}_conf{j + 1}"
                 sample = du.to_numpy(atom37_traj[-1][j : j + 1])[0]
-                # Save PDB directly with naming: cluster_XXXX_confN.pdb
                 au.write_complex_to_pdbs(
                     sample,
                     os.path.join(sample_dir, sample_name),
                     is_na_residue_mask=is_na_residue_mask,
                 )
 
-                pred_c4 = atom37_traj[-1][j, :sample_length, c4_idx]
+                pred_c4 = atom37_traj[-1][j, :, c4_idx]
                 rmsd_c4 = float("nan")
                 if valid_align:
                     try:
                         aligned_pred_c4 = metrics.superimpose(
-                            gt_c4_i, pred_c4[None, ...], mask=mask_i
+                            gt_c4_i, pred_c4[None, ...], mask=mask
                         )
                         rmsd_c4 = float(
-                            metrics.rmsd(gt_c4_i, aligned_pred_c4, mask=mask_i.float())
+                            metrics.rmsd(gt_c4_i, aligned_pred_c4, mask=mask.float())
                             .detach()
                             .cpu()
                             .numpy()[0]
@@ -645,7 +621,7 @@ class FlowModule(LightningModule):
                     "cluster_id": cluster_id,
                     "pdb_name": pdb_name,
                     "sample_name": sample_name,
-                    "length": sample_length,
+                    "length": num_res,
                     "rmsd_c4": rmsd_c4,
                     "sample_dir": sample_dir,
                 }

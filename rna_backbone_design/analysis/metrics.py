@@ -296,25 +296,25 @@ def gdt_score(
 
 
 
-def compute_single_metrics(pred_c4_i, gt_c4_i, mask_i):
+def compute_single_metrics(pred_c4, gt_c4, mask):
     """
-    pred_c4_i: [G, L, 3]
-    gt_c4_i: [1, L, 3]
-    mask_i: [1, L]
+    pred_c4: [G, L, 3]
+    gt_c4: [1, L, 3]
+    mask: [1, L]
     """
 
-    num_generated = pred_c4_i.shape[0]
-    rmsd_list = torch.full((num_generated, ), float("nan"), dtype=pred_c4_i.dtype, device=pred_c4_i.device)
+    num_generated = pred_c4.shape[0]
+    rmsd_list = torch.full((num_generated, ), float("nan"), dtype=pred_c4.dtype, device=pred_c4.device)
     tm_list = torch.full_like(rmsd_list, float("nan"))
     for j in range(num_generated):
-        pred_c4_j = pred_c4_i[j : j + 1]
+        pred_c4_j = pred_c4[j : j + 1]
         try:
-            pred_c4_aligned = superimpose(gt_c4_i, pred_c4_j, mask_i)
+            pred_c4_aligned = superimpose(gt_c4, pred_c4_j, mask)
         except RuntimeError:
             pred_c4_aligned = pred_c4_j
 
-        rmsd_j = rmsd(gt_c4_i, pred_c4_aligned, mask=mask_i)
-        tm_j = tm_score(gt_c4_i, pred_c4_aligned, mask=mask_i, apply_superimpose=False)
+        rmsd_j = rmsd(gt_c4, pred_c4_aligned, mask=mask)
+        tm_j = tm_score(gt_c4, pred_c4_aligned, mask=mask, apply_superimpose=False)
         rmsd_list[j] = rmsd_j.squeeze(0)
         tm_list[j] = tm_j.squeeze(0)
 
@@ -322,6 +322,49 @@ def compute_single_metrics(pred_c4_i, gt_c4_i, mask_i):
     best_rmsd = rmsd_list[valid].min() if valid.any() else rmsd_list[0]
     best_tm_score = tm_list[valid].max() if valid.any() else tm_list[0]
     return {"rmsd": best_rmsd, "tm_score": best_tm_score}
+
+
+def compute_ensemble_metrics(pred_c4, gt_c4, mask, deltas=(3.0, 4.0)):
+    """
+    pred_c4: [G, L, 3] - generated conformers
+    gt_c4: [K, L, 3] - ground truth conformers
+    mask: [L] - residue mask
+    deltas: RMSD thresholds for coverage metrics
+    """
+    G = pred_c4.shape[0]
+    K = gt_c4.shape[0]
+
+    if mask.dim() == 1:
+        mask = mask.unsqueeze(0)  # [1, L]
+
+    # RMSD matrix [G, K]
+    rmsd_matrix = torch.zeros(G, K, device=pred_c4.device)
+    for g in range(G):
+        for k in range(K):
+            aligned = superimpose(gt_c4[k:k+1], pred_c4[g:g+1], mask)
+            rmsd_matrix[g, k] = rmsd(gt_c4[k:k+1], aligned, mask=mask)
+
+    min_rmsd_per_gt = rmsd_matrix.min(dim=0).values      # [K]
+    min_rmsd_per_pred = rmsd_matrix.min(dim=1).values     # [G]
+
+    result = {
+        "amr_recall": min_rmsd_per_gt.mean().item(),
+        "amr_precision": min_rmsd_per_pred.mean().item(),
+    }
+
+    for d in deltas:
+        result[f"cov_recall_{d}"] = (min_rmsd_per_gt <= d).float().mean().item()
+        result[f"cov_precision_{d}"] = (min_rmsd_per_pred <= d).float().mean().item()
+
+    # Pairwise RMSD among generated samples
+    pairwise_rmsds = []
+    for i in range(G):
+        for j in range(i + 1, G):
+            aligned_j = superimpose(pred_c4[i:i+1], pred_c4[j:j+1], mask)
+            pairwise_rmsds.append(rmsd(pred_c4[i:i+1], aligned_j, mask=mask).item())
+    result["pairwise_rmsd"] = sum(pairwise_rmsds) / len(pairwise_rmsds) if pairwise_rmsds else 0.0
+
+    return result
 
 
 
