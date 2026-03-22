@@ -24,6 +24,7 @@ from Bio import PDB
 from Bio.PDB import MMCIFParser
 from tqdm import tqdm
 
+from rna_backbone_design.analysis.metrics import pairwise_rmsd_matrix
 from rna_backbone_design.data import data_transforms
 from rna_backbone_design.data import nucleotide_constants as nc
 from rna_backbone_design.data import parsers
@@ -299,7 +300,7 @@ def process_conformers(
         if len(conformers) >= 2:
             coords = torch.stack([conformer["c4_coords"] for conformer in conformers], dim=0)
             masks = torch.stack([conformer["res_mask"] for conformer in conformers], dim=0)
-            rmsd_matrix = _pairwise_rmsd_matrix(coords, masks.prod(dim=0).float())
+            rmsd_matrix = pairwise_rmsd_matrix(coords, masks.prod(dim=0).float())
         else:
             rmsd_matrix = torch.zeros(1, 1)
         for conformer in conformers:

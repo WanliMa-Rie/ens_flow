@@ -324,6 +324,25 @@ def compute_single_metrics(pred_c4, gt_c4, mask):
     return {"rmsd": best_rmsd, "tm_score": best_tm_score}
 
 
+def pairwise_rmsd_matrix(coords, mask):
+    """
+    coords: [N, L, 3]
+    mask: [L] or [1, L]
+    Returns: [N, N] symmetric RMSD matrix (with superimposition)
+    """
+    N = coords.shape[0]
+    if mask.dim() == 1:
+        mask = mask.unsqueeze(0)  # [1, L]
+    matrix = torch.zeros(N, N, device=coords.device)
+    for i in range(N):
+        for j in range(i + 1, N):
+            aligned_j = superimpose(coords[i:i+1], coords[j:j+1], mask)
+            val = rmsd(coords[i:i+1], aligned_j, mask=mask).item()
+            matrix[i, j] = val
+            matrix[j, i] = val
+    return matrix
+
+
 def compute_ensemble_metrics(pred_c4, gt_c4, mask, deltas=(3.0, 4.0)):
     """
     pred_c4: [G, L, 3] - generated conformers
@@ -357,12 +376,12 @@ def compute_ensemble_metrics(pred_c4, gt_c4, mask, deltas=(3.0, 4.0)):
         result[f"cov_precision_{d}"] = (min_rmsd_per_pred <= d).float().mean().item()
 
     # Pairwise RMSD among generated samples
-    pairwise_rmsds = []
-    for i in range(G):
-        for j in range(i + 1, G):
-            aligned_j = superimpose(pred_c4[i:i+1], pred_c4[j:j+1], mask)
-            pairwise_rmsds.append(rmsd(pred_c4[i:i+1], aligned_j, mask=mask).item())
-    result["pairwise_rmsd"] = sum(pairwise_rmsds) / len(pairwise_rmsds) if pairwise_rmsds else 0.0
+    if G >= 2:
+        pw_matrix = pairwise_rmsd_matrix(pred_c4, mask)
+        triu_idx = torch.triu_indices(G, G, offset=1)
+        result["pairwise_rmsd"] = pw_matrix[triu_idx[0], triu_idx[1]].mean().item()
+    else:
+        result["pairwise_rmsd"] = 0.0
 
     return result
 
