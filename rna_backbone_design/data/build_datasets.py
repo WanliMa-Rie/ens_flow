@@ -29,7 +29,6 @@ from rna_backbone_design.data import nucleotide_constants as nc
 from rna_backbone_design.data import parsers
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.data.rigid_utils import Rigid
-from rna_backbone_design.analysis.ensemble_metrics import _pairwise_rmsd_matrix
 
 
 def parse_args():

@@ -357,7 +357,7 @@ class FlowModule(LightningModule):
             rank_zero_only=rank_zero_only,
         )
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch):
         """
         Performs one iteration of SE(3) flow matching and returns total training loss
         using the core and auxiliary losses computed in `model_step`.
@@ -435,198 +435,84 @@ class FlowModule(LightningModule):
             params=self.model.parameters(), **self._exp_cfg.optimizer
         )
 
-    def _save_gt_pdbs(self, cluster_id, gt_dir):
-        cfg = getattr(getattr(self, "hparams", None), "cfg", None)
-        data_dir = getattr(getattr(cfg, "data_cfg", None), "data_dir", None)
-        if data_dir is None and cfg is not None:
-            try:
-                data_dir = cfg["data_cfg"]["data_dir"]
-            except Exception:
-                data_dir = None
-        if not data_dir:
-            return
-
-        pdb_paths = sorted(
-            glob.glob(os.path.join(str(data_dir), cluster_id, "structure", "*.pdb"))
-        )
-        if pdb_paths:
-            for src in pdb_paths:
-                dst = os.path.join(gt_dir, os.path.basename(src))
-                if os.path.exists(dst):
-                    continue
-                try:
-                    shutil.copy2(src, dst)
-                except Exception as e:
-                    self._print_logger.warning(f"Failed to copy GT PDB {src}: {e}")
-            return
-
-        pkl_paths = sorted(
-            glob.glob(os.path.join(str(data_dir), cluster_id, "features", "*.pkl"))
-        )
-        for pkl_path in pkl_paths:
-            name = os.path.splitext(os.path.basename(pkl_path))[0]
-            expected = os.path.join(gt_dir, f"na_{name}.pdb")
-            if os.path.exists(expected):
-                continue
-            try:
-                feats = du.read_pkl(pkl_path)
-                feats = du.parse_complex_feats(feats)
-                pos = feats["atom_positions"]
-                if pos.ndim == 3:
-                    _, n_atoms, _ = pos.shape
-                    if n_atoms < 37:
-                        pos = np.pad(pos, ((0, 0), (0, 37 - n_atoms), (0, 0)))
-                au.write_complex_to_pdbs(
-                    pos,
-                    os.path.join(gt_dir, name),
-                    is_na_residue_mask=np.ones(pos.shape[0], dtype=np.int64),
-                )
-            except Exception as e:
-                self._print_logger.warning(f"Failed to write GT from {pkl_path}: {e}")
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        device = batch["res_mask"].device
         interpolant = Interpolant(self._infer_cfg.interpolant)
-        interpolant.set_device(device)
+        interpolant.set_device(batch["res_mask"].device)
 
-        res_mask = batch["res_mask"]
-        num_batch, num_res = res_mask.shape
-        mask_bool = res_mask > 0.5
-
-        gt_trans_1 = batch["trans_1"]
-        gt_rotmats_1 = batch["rotmats_1"]
-        gt_torsions_1 = batch["torsion_angles_sin_cos"][:, :, :8, :].reshape(
-            num_batch, -1, 16
-        )
-        is_na_residue_mask = torch.ones_like(res_mask, dtype=torch.bool)
-        gt_atoms = rna_all_atom.to_atom37_rna(
-            gt_trans_1, gt_rotmats_1, is_na_residue_mask, torsions=gt_torsions_1
-        )
+        num_batch = batch["is_na_residue_mask"].shape[0]
         c4_idx = nucleotide_constants.atom_order["C4'"]
-        gt_c4 = gt_atoms[:, :, c4_idx]
 
-        pdb_names = batch.get("pdb_name", None)
-        if pdb_names is None:
-            pdb_names = [None] * num_batch
-        cluster_ids = batch.get("cluster_id", None)
-        if cluster_ids is None:
-            cluster_ids = batch.get("cluster_name", None)
-        if isinstance(cluster_ids, torch.Tensor):
-            cluster_ids = cluster_ids.detach().cpu().tolist()
-        if cluster_ids is None:
-            cluster_ids = [None] * num_batch
+        ensemble_cfg = getattr(self._infer_cfg, "ensemble", None)
+        ensemble_enabled = bool(getattr(ensemble_cfg, "enabled", False)) if ensemble_cfg else False
+        num_generated = int(getattr(ensemble_cfg, "num_generated", 1)) if ensemble_enabled else 1
+        num_generated = max(1, num_generated)
 
         outputs = []
 
-        ensemble_cfg = getattr(self._infer_cfg, "ensemble", None)
-        ensemble_enabled = False
-        ensemble_num_generated = 0
-        ensemble_write_pdbs = False
-        if ensemble_cfg is not None:
-            ensemble_enabled = bool(getattr(ensemble_cfg, "enabled", False))
-            ensemble_num_generated = int(getattr(ensemble_cfg, "num_generated", 0))
-            ensemble_write_pdbs = bool(getattr(ensemble_cfg, "write_ensemble_pdbs", False))
-
         for i in range(num_batch):
-            if isinstance(cluster_ids, (list, tuple)) and i < len(cluster_ids) and cluster_ids[i] is not None:
-                cluster_id = str(cluster_ids[i])
-            else:
-                cluster_id = "unknown_cluster"
+            sample = batch[i]
+            mask = sample["is_na_residue_mask"]
+            num_res = int(mask.sum().item())
+            cluster_id = str(sample.get("cluster_id", sample.get("cluster_name", "unknown")))
+            pdb_name = sample.get("pdb_name", None)
 
-            if ensemble_enabled:
-                sample_dir = os.path.join(self._output_dir, cluster_id)
-            else:
-                sample_dir = os.path.join(self._output_dir, cluster_id, f"length_{num_res}")
+            # Output directory
+            sample_dir = os.path.join(self._output_dir, cluster_id)
+            if not ensemble_enabled:
+                sample_dir = os.path.join(sample_dir, f"length_{num_res}")
             os.makedirs(sample_dir, exist_ok=True)
 
-            gt_ens_list = batch.get("gt_c4_ensemble", None)
-            gt_ens = None
-            if isinstance(gt_ens_list, list):
-                gt_ens = gt_ens_list[i]
-
-            num_generated = int(ensemble_num_generated) if ensemble_enabled else 1
-            num_generated = max(1, num_generated)
-            context_single = batch["single_embedding"][i : i + 1]
-            context_pair = batch["pair_embedding"][i : i + 1]
-            if num_generated > 1:
-                context = {
-                    "single_embedding": context_single.repeat(num_generated, 1, 1),
-                    "pair_embedding": context_pair.repeat(num_generated, 1, 1, 1),
-                }
-            else:
-                context = {
-                    "single_embedding": context_single,
-                    "pair_embedding": context_pair,
-                }
-
+            # Generate samples
+            context = {
+                "single_embedding": sample["single_embedding"].repeat(num_generated, 1, 1),
+                "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
+            }
             atom37_traj, _, _ = interpolant.sample(
                 num_generated, num_res, self.model, context=context
             )
+            pred_c4 = atom37_traj[-1][:, :, c4_idx]  # [num_generated, num_res, 3]
 
-            ens_metrics = None
-            if (
-                ensemble_enabled
-                and gt_ens is not None
-                and isinstance(gt_ens, torch.Tensor)
-                and num_generated >= 2
-                and int(gt_ens.shape[0]) >= 2
-            ):
-                k = min(num_generated, int(gt_ens.shape[0]))
-                if k >= 2:
-                    pred_ens = atom37_traj[-1][:k, :, c4_idx]
-                    gt_ens_i = gt_ens[:k].to(pred_ens.device)
-                    m = mask_bool[i].to(pred_ens.device)
-                    ens = compute_ensemble_metrics(gt_ens_i, pred_ens, m)
-                    ens_metrics = {
-                        "ens_pairwise_rmsd": ens.pairwise_rmsd,
-                        "ens_w2": ens.w2_distance,
-                        "ens_pairwise_rmsd_r": ens.pairwise_rmsd_r,
-                        "ens_k": k,
-                        "ens_num_generated": num_generated,
-                        "ens_num_gt_available": int(gt_ens.shape[0]),
-                    }
-
-            pdb_name = pdb_names[i] if isinstance(pdb_names, list) else None
-            is_na_residue_mask = np.ones(num_res, dtype=np.int64)
-            gt_c4_i = gt_c4[i : i + 1]
-            mask = mask_bool[i : i + 1]
-            valid_align = bool(mask.sum().item() >= 3)
-
+            # Write PDB files
+            is_na = np.ones(num_res, dtype=np.int64)
             for j in range(num_generated):
-                sample_name = f"{cluster_id}_conf{j + 1}"
-                sample = du.to_numpy(atom37_traj[-1][j : j + 1])[0]
                 au.write_complex_to_pdbs(
-                    sample,
-                    os.path.join(sample_dir, sample_name),
-                    is_na_residue_mask=is_na_residue_mask,
+                    du.to_numpy(atom37_traj[-1][j:j+1])[0],
+                    os.path.join(sample_dir, f"{cluster_id}_conf{j+1}"),
+                    is_na_residue_mask=is_na,
                 )
 
-                pred_c4 = atom37_traj[-1][j, :, c4_idx]
-                rmsd_c4 = float("nan")
-                if valid_align:
-                    try:
-                        aligned_pred_c4 = metrics.superimpose(
-                            gt_c4_i, pred_c4[None, ...], mask=mask
-                        )
-                        rmsd_c4 = float(
-                            metrics.rmsd(gt_c4_i, aligned_pred_c4, mask=mask.float())
-                            .detach()
-                            .cpu()
-                            .numpy()[0]
-                        )
-                    except RuntimeError:
-                        rmsd_c4 = float("nan")
+            # GT C4' coords
+            gt_torsions = sample["torsion_angles_sin_cos"][:, :8, :].reshape(1, -1, 16)
+            gt_atoms = rna_all_atom.to_atom37_rna(
+                sample["trans_1"].unsqueeze(0),
+                sample["rotmats_1"].unsqueeze(0),
+                mask.unsqueeze(0).bool(),
+                torsions=gt_torsions,
+            )
+            gt_c4 = gt_atoms[:, :, c4_idx]  # [1, num_res, 3]
 
-                out_row = {
-                    "cluster_id": cluster_id,
-                    "pdb_name": pdb_name,
-                    "sample_name": sample_name,
-                    "length": num_res,
-                    "rmsd_c4": rmsd_c4,
-                    "sample_dir": sample_dir,
-                }
-                if ens_metrics is not None:
-                    out_row.update(ens_metrics)
-                outputs.append(out_row)
+            # Single metrics (best RMSD/TM across all generated)
+            single_result = metrics.compute_single_metrics(
+                pred_c4, gt_c4, mask.unsqueeze(0)
+            )
+
+            out_row = {
+                "cluster_id": cluster_id,
+                "pdb_name": pdb_name,
+                "length": num_res,
+                "rmsd": float(single_result["rmsd"]),
+                "tm_score": float(single_result["tm_score"]),
+                "sample_dir": sample_dir,
+            }
+
+            # Ensemble metrics
+            if ensemble_enabled and num_generated >= 2:
+                gt_c4_ens = sample.get("gt_c4_ensemble", None)
+                if gt_c4_ens is not None:
+                    ens_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, mask)
+                    out_row.update(ens_result)
+
+            outputs.append(out_row)
 
         return outputs
