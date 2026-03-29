@@ -1,3 +1,4 @@
+import random
 import torch, copy
 from rna_backbone_design.data import so3_utils
 from rna_backbone_design.data import utils as du
@@ -148,6 +149,123 @@ class Interpolant:
 
         return noisy_batch
 
+    def corrupt_ensemble(self, batch):
+        """Corrupt anchor + neighbor conformers with shared x_0 and shared t.
+
+        Returns noisy_batch with:
+        - Standard keys (trans_t, rotmats_t, trans_1, rotmats_1) for a randomly chosen conformer j
+        - ensemble_trans_t: [B, K, N, 3] all conformers' noisy translations
+        - ensemble_rotmats_t: [B, K, N, 3, 3] all conformers' noisy rotations
+        - ensemble_mask: [B, K] valid conformer mask
+        """
+        noisy_batch = copy.deepcopy(batch)
+
+        trans_1 = batch["trans_1"]  # [B, N, 3] anchor
+        rotmats_1 = batch["rotmats_1"]  # [B, N, 3, 3] anchor
+        res_mask = batch["res_mask"]  # [B, N]
+        num_batch, num_res = res_mask.shape
+
+        # Shared t across all conformers
+        t = self.sample_t(num_batch)[:, None]  # [B, 1]
+        noisy_batch["t"] = t
+
+        # Shared trans_0, OT-aligned to anchor
+        trans_0 = _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
+        trans_0 = self._batch_ot(trans_0, trans_1, res_mask)
+
+        # Shared rotation noise
+        noisy_rotmats = self.igso3.sample(
+            torch.tensor([1.5]), num_batch * num_res
+        ).to(self._device).reshape(num_batch, num_res, 3, 3)
+
+        # Collect neighbor data (passthrough lists from collate)
+        nbr_trans_list = batch.get("nbr_trans", [None] * num_batch)
+        nbr_rotmats_list = batch.get("nbr_rotmats", [None] * num_batch)
+
+        all_ens_trans_t = []
+        all_ens_rotmats_t = []
+        all_ens_trans_1 = []
+        all_ens_rotmats_1 = []
+
+        for i in range(num_batch):
+            # Build ensemble: anchor + neighbors
+            anchor_t1 = trans_1[i].unsqueeze(0)  # [1, N, 3]
+            anchor_r1 = rotmats_1[i].unsqueeze(0)  # [1, N, 3, 3]
+
+            nbr_t = nbr_trans_list[i]
+            nbr_r = nbr_rotmats_list[i]
+            if nbr_t is not None and nbr_t.numel() > 0:
+                nbr_t = nbr_t.to(self._device)
+                nbr_r = nbr_r.to(self._device)
+                ens_trans_1 = torch.cat([anchor_t1, nbr_t], dim=0)  # [K, N, 3]
+                ens_rotmats_1 = torch.cat([anchor_r1, nbr_r], dim=0)  # [K, N, 3, 3]
+            else:
+                ens_trans_1 = anchor_t1
+                ens_rotmats_1 = anchor_r1
+
+            t_i = t[i]  # [1]
+            trans_0_i = trans_0[i]  # [N, 3]
+            noise_i = noisy_rotmats[i]  # [N, 3, 3]
+
+            # Corrupt translations: x_t = (1-t)*x_0 + t*x_1 (shared x_0)
+            ens_trans_t = (1 - t_i) * trans_0_i.unsqueeze(0) + t_i * ens_trans_1
+
+            # Corrupt rotations: rotmats_0 = rotmats_1 @ noise (shared noise)
+            ens_rotmats_0 = torch.einsum("knij,njl->knil", ens_rotmats_1, noise_i)
+            ens_rotmats_t = so3_utils.geodesic_t(
+                t_i.unsqueeze(0), ens_rotmats_1, ens_rotmats_0
+            )
+
+            all_ens_trans_t.append(ens_trans_t)
+            all_ens_rotmats_t.append(ens_rotmats_t)
+            all_ens_trans_1.append(ens_trans_1)
+            all_ens_rotmats_1.append(ens_rotmats_1)
+
+        # Pad ensemble dim to max K across batch
+        max_K = max(x.shape[0] for x in all_ens_trans_t)
+        ensemble_trans_t = torch.zeros(num_batch, max_K, num_res, 3, device=self._device)
+        ensemble_rotmats_t = torch.zeros(num_batch, max_K, num_res, 3, 3, device=self._device)
+        ensemble_trans_1 = torch.zeros(num_batch, max_K, num_res, 3, device=self._device)
+        ensemble_rotmats_1 = torch.zeros(num_batch, max_K, num_res, 3, 3, device=self._device)
+        ensemble_mask = torch.zeros(num_batch, max_K, device=self._device)
+
+        for i in range(num_batch):
+            K_i = all_ens_trans_t[i].shape[0]
+            ensemble_trans_t[i, :K_i] = all_ens_trans_t[i]
+            ensemble_rotmats_t[i, :K_i] = all_ens_rotmats_t[i]
+            ensemble_trans_1[i, :K_i] = all_ens_trans_1[i]
+            ensemble_rotmats_1[i, :K_i] = all_ens_rotmats_1[i]
+            ensemble_mask[i, :K_i] = 1.0
+
+        noisy_batch["ensemble_trans_t"] = ensemble_trans_t
+        noisy_batch["ensemble_rotmats_t"] = ensemble_rotmats_t
+        noisy_batch["ensemble_mask"] = ensemble_mask
+
+        # Scheme B: randomly select one conformer j per sample as decoder target
+        j_indices = torch.tensor(
+            [random.randint(0, int(ensemble_mask[i].sum().item()) - 1) for i in range(num_batch)],
+            device=self._device,
+        )
+
+        # Gather selected conformer for decoder
+        j_idx = j_indices[:, None, None, None].expand(-1, 1, num_res, 3)
+        noisy_batch["trans_t"] = ensemble_trans_t.gather(1, j_idx).squeeze(1)
+        noisy_batch["trans_1"] = ensemble_trans_1.gather(1, j_idx).squeeze(1)
+
+        j_idx_rot = j_indices[:, None, None, None, None].expand(-1, 1, num_res, 3, 3)
+        noisy_batch["rotmats_t"] = ensemble_rotmats_t.gather(1, j_idx_rot).squeeze(1)
+        noisy_batch["rotmats_1"] = ensemble_rotmats_1.gather(1, j_idx_rot).squeeze(1)
+
+        # Apply diffuse mask
+        noisy_batch["trans_t"] = _trans_diffuse_mask(
+            noisy_batch["trans_t"], batch["trans_1"], res_mask
+        ) * res_mask[..., None]
+        noisy_batch["rotmats_t"] = _rots_diffuse_mask(
+            noisy_batch["rotmats_t"], batch["rotmats_1"], res_mask
+        )
+
+        return noisy_batch
+
     def rot_sample_kappa(self, t):
         if self._rots_cfg.sample_schedule == "exp":
             return 1 - torch.exp(-t * self._rots_cfg.exp_rate)
@@ -205,6 +323,8 @@ class Interpolant:
         if context is not None:
             batch["single_embedding"] = context["single_embedding"]
             batch["pair_embedding"] = context["pair_embedding"]
+            if "latent_z" in context:
+                batch["latent_z"] = context["latent_z"]
 
         # get diffusion timesteps in order between [0, 1]
         ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)

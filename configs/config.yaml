@@ -1,3 +1,12 @@
+mode: flow  # "flow" or "ens_flow"
+
+ens_flow:
+  z_dim: 64
+  kl_weight: 0.001
+  free_bits: 0.1  # per-dim KL floor (nats) to prevent posterior collapse
+  structure_encoder:
+    num_blocks: 2
+
 data_cfg:
   data_dir: /projects/u6bk/wanli/rna_ensemble_data # Path to ensemble data root
   preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data

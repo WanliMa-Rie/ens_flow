@@ -17,6 +17,9 @@ inference:
 
   num_gpus: 4
 
+  ens_flow:
+    num_z_samples: 5
+
   interpolant:
     min_t: 1e-2
     rots:
