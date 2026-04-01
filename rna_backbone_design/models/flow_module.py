@@ -18,7 +18,6 @@ from pytorch_lightning import LightningModule
 from rna_backbone_design.analysis import metrics
 from rna_backbone_design.analysis import utils as au
 from rna_backbone_design.models.flow_model import FlowModel
-from rna_backbone_design.models.ens_flow_model import EnsFlowModel
 from rna_backbone_design.models import utils as mu
 from rna_backbone_design.data.interpolant import Interpolant
 from rna_backbone_design.data import utils as du
@@ -29,40 +28,17 @@ from rna_backbone_design.analysis import utils as au
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 
-def _kl_divergence(mu_q, log_sigma_q, mu_p, log_sigma_p, free_bits=0.0):
-    """KL(q || p) for diagonal Gaussians with free bits.
-
-    Free bits (Kingma et al., 2016): per-dimension KL is clamped to at least
-    `free_bits` nats, preventing posterior collapse while still allowing the
-    latent to carry information above the threshold.
-    """
-    sigma_q_sq = torch.exp(2 * log_sigma_q)
-    sigma_p_sq = torch.exp(2 * log_sigma_p)
-    kl_per_dim = 0.5 * (
-        log_sigma_p - log_sigma_q + sigma_q_sq / sigma_p_sq
-        + (mu_q - mu_p) ** 2 / sigma_p_sq - 1
-    )
-    if free_bits > 0.0:
-        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
-    return kl_per_dim.sum(dim=-1)
-
-
 class FlowModule(LightningModule):
     def __init__(self, cfg, folding_cfg=None):
         super().__init__()
         self._print_logger = logging.getLogger(__name__)
-        self._cfg = cfg
         self._exp_cfg = cfg.experiment
         self._validation = self._exp_cfg.validation
         self._model_cfg = cfg.model
         self._interpolant_cfg = cfg.interpolant
-        self._mode = getattr(cfg, "mode", "flow")
 
         # Set-up vector field prediction model
-        if self._mode == "ens_flow":
-            self.model = EnsFlowModel(cfg.model, cfg.ens_flow)
-        else:
-            self.model = FlowModel(cfg.model)
+        self.model = FlowModel(cfg.model)
 
         # Set-up interpolant
         self.interpolant = Interpolant(cfg.interpolant)
@@ -314,17 +290,6 @@ class FlowModule(LightningModule):
                 "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
             }
 
-            # For ens_flow: sample z from prior and inject into context
-            if self._mode == "ens_flow":
-                seq_emb = sample["single_embedding"].unsqueeze(0)
-                dummy_mask = mask.unsqueeze(0)
-                with torch.no_grad():
-                    mu_p, log_sigma_p = self.model.encode_prior(
-                        {"single_embedding": seq_emb}, dummy_mask
-                    )
-                    z = self.model.sample_z(mu_p, log_sigma_p)  # [1, z_dim]
-                context["latent_z"] = z.expand(num_generated, -1)
-
             atom37_traj, _, _ = self.interpolant.sample(
                 num_generated, num_res, self.model, context=context
             )
@@ -392,76 +357,12 @@ class FlowModule(LightningModule):
             rank_zero_only=rank_zero_only,
         )
 
-    def _ens_flow_training_step(self, batch):
-        """Training step for ens_flow mode with latent variable."""
-        noisy_batch = self.interpolant.corrupt_ensemble(batch)
-
-        if self._interpolant_cfg.self_condition and random.random() > 0.5:
-            with torch.no_grad():
-                model_sc = self.model(noisy_batch)
-                noisy_batch["trans_sc"] = model_sc["pred_trans"]
-
-        res_mask = noisy_batch["res_mask"]
-
-        # Posterior: encode ensemble
-        mu_q, log_sigma_q = self.model.encode_posterior(
-            noisy_batch,
-            noisy_batch["ensemble_trans_t"],
-            noisy_batch["ensemble_rotmats_t"],
-            res_mask,
-            noisy_batch["ensemble_mask"],
-        )
-
-        # Prior: encode sequence only
-        mu_p, log_sigma_p = self.model.encode_prior(noisy_batch, res_mask)
-
-        # Sample z from posterior (reparameterization trick)
-        z = self.model.sample_z(mu_q, log_sigma_q)
-        noisy_batch["latent_z"] = z
-
-        # Flow matching losses on selected conformer j
-        batch_losses = self.model_step(noisy_batch)
-
-        # KL divergence with free bits
-        free_bits = getattr(self._cfg.ens_flow, "free_bits", 0.1)
-        kl_loss = _kl_divergence(mu_q, log_sigma_q, mu_p, log_sigma_p, free_bits=free_bits)
-
-        num_batch = batch_losses["bb_atom_loss"].shape[0]
-        total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
-        total_losses["kl_loss"] = kl_loss.mean()
-
-        for k, v in total_losses.items():
-            self._log_scalar(
-                f"train/{k}", v,
-                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
-            )
-
-        train_loss = (
-            total_losses[self._exp_cfg.training.loss]
-            + total_losses["auxiliary_loss"]
-            + self._cfg.ens_flow.kl_weight * total_losses["kl_loss"]
-        )
-        self.log(
-            "pbar/loss", train_loss,
-            on_step=True, on_epoch=False, prog_bar=True, logger=False,
-            batch_size=num_batch, rank_zero_only=True,
-        )
-        self._log_scalar(
-            "train/loss", train_loss,
-            on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
-        )
-        return train_loss
-
     def training_step(self, batch):
         """
         Performs one iteration of SE(3) flow matching and returns total training loss
         using the core and auxiliary losses computed in `model_step`.
         """
         self.interpolant.set_device(batch["res_mask"].device)
-
-        if self._mode == "ens_flow":
-            return self._ens_flow_training_step(batch)
-
         noisy_batch = self.interpolant.corrupt_batch(batch)
 
         if self._interpolant_cfg.self_condition and random.random() > 0.5:
@@ -482,6 +383,28 @@ class FlowModule(LightningModule):
                 prog_bar=False,
                 batch_size=num_batch,
             )
+
+        # # Losses to track. Stratified across t.
+        # t = torch.squeeze(noisy_batch["t"])
+        # self._log_scalar(
+        #     "train/t", np.mean(du.to_numpy(t)), prog_bar=False, batch_size=num_batch
+        # )
+        # for loss_name, loss_dict in batch_losses.items():
+        #     stratified_losses = mu.t_stratified_loss(t, loss_dict, loss_name=loss_name)
+        #     for k, v in stratified_losses.items():
+        #         self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
+
+        # # Training throughput
+        # self._log_scalar(
+        #     "train/length",
+        #     batch["res_mask"].shape[1],
+        #     prog_bar=False,
+        #     batch_size=num_batch,
+        # )
+        # self._log_scalar("train/batch_size", num_batch, prog_bar=False)
+        #
+        # step_time = time.time() - step_start_time
+        # self._log_scalar("train/eps", num_batch / step_time)
 
         train_loss = (
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
@@ -545,18 +468,6 @@ class FlowModule(LightningModule):
                 "single_embedding": sample["single_embedding"].repeat(num_generated, 1, 1),
                 "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
             }
-
-            # For ens_flow: sample z from prior and inject into context
-            if self._mode == "ens_flow":
-                seq_emb = sample["single_embedding"].unsqueeze(0)
-                dummy_mask = mask.unsqueeze(0)
-                with torch.no_grad():
-                    mu_p, log_sigma_p = self.model.encode_prior(
-                        {"single_embedding": seq_emb}, dummy_mask
-                    )
-                    z = self.model.sample_z(mu_p, log_sigma_p)  # [1, z_dim]
-                context["latent_z"] = z.expand(num_generated, -1)
-
             atom37_traj, _, _ = interpolant.sample(
                 num_generated, num_res, self.model, context=context
             )
