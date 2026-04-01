@@ -23,7 +23,6 @@ from Bio import SeqIO
 from Bio.PDB import MMCIFParser
 from tqdm import tqdm
 
-from rna_backbone_design.analysis.metrics import pairwise_rmsd_matrix
 from rna_backbone_design.data import data_transforms
 from rna_backbone_design.data import nucleotide_constants as nc
 from rna_backbone_design.data import vocabulary
@@ -132,6 +131,7 @@ def align_structure_to_full_sequence(
     atom_positions = np.zeros((seq_len, num_atoms, 3), dtype=np.float64)
     atom_mask = np.zeros((seq_len, num_atoms), dtype=np.float64)
     atom_deoxy = np.zeros(seq_len, dtype=bool)
+    atom_b_factors = np.zeros((seq_len, num_atoms), dtype=np.float64)
 
     # Place each resolved residue at its label_seq_id position
     occupied = set()
@@ -145,15 +145,18 @@ def align_structure_to_full_sequence(
         compact_atom_order = nc.restype_name_to_compact_atom_order[resname]
         pos = np.zeros((num_atoms, 3), dtype=np.float64)
         mask = np.zeros(num_atoms, dtype=np.float64)
+        res_b = np.zeros(num_atoms, dtype=np.float64)
         for atom in res:
             if atom.name not in compact_atom_order:
                 continue
             atom_idx = compact_atom_order[atom.name]
             pos[atom_idx] = atom.coord
             mask[atom_idx] = 1.0
+            res_b[atom_idx] = atom.bfactor
 
         atom_positions[idx] = pos
         atom_mask[idx] = mask
+        atom_b_factors[idx] = res_b
 
         if hasattr(nc, "deoxy_restypes") and resname in nc.deoxy_restypes:
             atom_deoxy[idx] = True
@@ -171,6 +174,7 @@ def align_structure_to_full_sequence(
         "atom_positions": atom_positions,
         "atom_mask": atom_mask,
         "atom_deoxy": atom_deoxy,
+        "atom_b_factors": atom_b_factors,
         "is_na_residue_mask": np.ones(seq_len, dtype=bool),
     }
 
@@ -188,6 +192,7 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     atom_positions = torch.as_tensor(processed_feats["atom_positions"]).double()
     atom_mask = torch.as_tensor(processed_feats["atom_mask"]).double()
     atom_deoxy = torch.as_tensor(processed_feats["atom_deoxy"]).bool()
+    atom_b_factors = torch.as_tensor(processed_feats["atom_b_factors"]).float()
 
     num_res = int(aatype.shape[0])
     c4_idx = int(nc.atom_order["C4'"])
@@ -233,6 +238,9 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     torsion_angles_sin_cos = na_feats["torsion_angles_sin_cos"][:, :8].float()
     torsion_angles_mask = na_feats["torsion_angles_mask"][:, :8].float()
 
+    # Per-residue B-factor from C4' atom
+    b_factors = atom_b_factors[:, c4_idx]
+
     # Normalize unsolved positions: zero geometry, identity rotation
     unsolved = (res_mask == 0)
     trans_1[unsolved] = 0.0
@@ -241,6 +249,7 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     bb_coords[unsolved] = 0.0
     torsion_angles_sin_cos[unsolved] = 0.0
     torsion_angles_mask[unsolved] = 0.0
+    b_factors[unsolved] = 0.0
 
     return {
         "aatype": aatype,
@@ -252,6 +261,7 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
         "is_na_residue_mask": is_na_residue_mask,
         "c4_coords": c4_coords,
         "bb_coords": bb_coords,
+        "b_factors": b_factors,
     }
 
 
@@ -266,7 +276,6 @@ def process_conformers(
     cluster_dir: pathlib.Path,
     split_name: str,
     full_sequence: str,
-    do_rmsd: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
     pdb_files = sorted((cluster_dir / "structure").glob("*.cif"))
     if not pdb_files:
@@ -295,6 +304,7 @@ def process_conformers(
                 "is_na_residue_mask": geom["is_na_residue_mask"],
                 "c4_coords": geom["c4_coords"],
                 "bb_coords": geom["bb_coords"],
+                "b_factors": geom["b_factors"],
             }
         )
 
@@ -306,16 +316,6 @@ def process_conformers(
     for conformer in conformers:
         conformer["conformer_names"] = conformer_names
         conformer["cluster_size"] = cluster_size
-
-    if split_name == "train" and do_rmsd:
-        if len(conformers) >= 2:
-            coords = torch.stack([conformer["c4_coords"] for conformer in conformers], dim=0)
-            masks = torch.stack([conformer["res_mask"] for conformer in conformers], dim=0)
-            rmsd_matrix = pairwise_rmsd_matrix(coords, masks.prod(dim=0).float())
-        else:
-            rmsd_matrix = torch.zeros(1, 1)
-        for conformer in conformers:
-            conformer["rmsd_matrix"] = rmsd_matrix
 
     return conformers
 
@@ -361,7 +361,6 @@ def main():
         print(f"Processing split: {split_name} ({len(split_cluster_names)} clusters)")
         print(f"{'=' * 60}")
 
-        do_rmsd = split_name == "train"
         conformer_list: List[Dict[str, Any]] = []
         skipped = 0
         t0 = time.time()
@@ -375,7 +374,6 @@ def main():
                 cluster_dir=data_dir / cluster_name,
                 split_name=split_name,
                 full_sequence=full_sequences[cluster_name],
-                do_rmsd=do_rmsd,
             )
             if records is None:
                 skipped += 1

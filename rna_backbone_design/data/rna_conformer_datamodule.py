@@ -42,10 +42,8 @@ _PAIR_KEYS = frozenset({"pair_embedding"})
 # Tensors with non-sequence-length leading dims, or variable-shape lists.
 # Collected as plain python lists, not pad-stacked.
 _PASSTHROUGH_KEYS = frozenset({
-    "nbr_trans", "nbr_rotmats", "nbr_c4",
     "gt_bb_ensemble", "gt_c4_ensemble",
     "conformer_names", "cluster_conformer_names",
-    "rmsd_matrix",
 })
 
 
@@ -86,7 +84,6 @@ class RNAConformerDataModule(LightningDataModule):
         self.pin_memory = bool(data_cfg.pin_memory)
         self.persistent_workers = bool(data_cfg.persistent_workers) and self.num_workers > 0
         self.drop_last = bool(data_cfg.drop_last)
-        self.posterior_nearest_p = int(data_cfg.posterior_nearest_p)
         self.val_ensemble_as_cluster = bool(data_cfg.val_ensemble_as_cluster)
         self.test_ensemble_as_cluster = bool(data_cfg.test_ensemble_as_cluster)
 
@@ -99,10 +96,7 @@ class RNAConformerDataModule(LightningDataModule):
     def _make_dataset(self, path: pathlib.Path, split: str, as_cluster: bool = False) -> Dataset:
         if as_cluster:
             return RNAClusterDataset(path, self.data_dir, split)
-        return RNAConformerDataset(
-            path, self.data_dir, split,
-            posterior_nearest_p=self.posterior_nearest_p if split == "train" else 0,
-        )
+        return RNAConformerDataset(path, self.data_dir, split)
 
     def _make_loader(self, dataset: Dataset, *, shuffle: bool) -> DataLoader:
         return DataLoader(

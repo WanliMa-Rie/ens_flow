@@ -87,52 +87,12 @@ class RNAConformerDataset(_BaseRNAConformerDataset):
         preprocessed_dir: pathlib.Path,
         data_dir: pathlib.Path,
         split: str = "train",
-        posterior_nearest_p: int = 3,
     ):
         super().__init__(
             preprocessed_dir=preprocessed_dir,
             data_dir=data_dir,
             split=split,
         )
-        self.posterior_nearest_p = int(posterior_nearest_p)
-
-    def _find_nearest_records(self, conf: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Return up to p nearest conformer records by RMSD, or [] if unavailable."""
-        rmsd_matrix = conf.get("rmsd_matrix")
-        conformer_names = self._record_conformer_names(conf)
-        if rmsd_matrix is None or conformer_names is None:
-            return []
-
-        anchor_name = str(conf["conformer_name"])
-
-        anchor_idx = conformer_names.index(anchor_name)
-        row = rmsd_matrix[anchor_idx].clone()
-        row[anchor_idx] = float("inf")
-
-        finite_idx = torch.where(torch.isfinite(row))[0]
-        if finite_idx.numel() == 0:
-            return []
-
-        nearest = finite_idx[torch.argsort(row[finite_idx])][: self.posterior_nearest_p]
-        conformer_lookup = self._cluster_map[str(conf["cluster_name"])]
-        return [
-            self.records[conformer_lookup[conformer_names[i]]]
-            for i in nearest.tolist()
-            if conformer_names[i] in conformer_lookup
-        ]
-
-    def _load_neighbors(self, conf: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """Load nearest-neighbor geometry; falls back to self-copy.
-
-        Same-cluster conformers share identical sequence length,
-        so no per-residue slicing or masking is needed.
-        """
-        records = self._find_nearest_records(conf) or [conf]
-        return {
-            "nbr_trans": torch.stack([r["trans_1"] for r in records]),
-            "nbr_rotmats": torch.stack([r["rotmats_1"] for r in records]),
-            "nbr_c4": torch.stack([r["c4_coords"] for r in records]),
-        }
 
     def __len__(self) -> int:
         return len(self.records)
@@ -140,8 +100,6 @@ class RNAConformerDataset(_BaseRNAConformerDataset):
     def __getitem__(self, record_idx: int) -> Dict[str, Any]:
         conformer = dict(self.records[record_idx])
         conformer.update(self._load_embeddings(conformer))
-        if self.split == "train" and self.posterior_nearest_p > 0:
-            conformer.update(self._load_neighbors(conformer))
         return conformer
 
 
