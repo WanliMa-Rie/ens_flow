@@ -42,9 +42,20 @@ class _BaseRNAConformerDataset(Dataset):
         embedding_dir = self.data_dir / record["embedding_dir"]
         single_path = next(embedding_dir.glob("*_single.npy"))
         pair_path = next(embedding_dir.glob("*_pair.npy"))
+        single_embedding = torch.from_numpy(np.load(single_path).astype(np.float32))
+        pair_embedding = torch.from_numpy(np.load(pair_path).astype(np.float32))
+        seq_len = int(record["seq_len"])
+        assert single_embedding.shape[0] == seq_len, (
+            f"single_embedding length {single_embedding.shape[0]} != seq_len {seq_len} "
+            f"for {record['cluster_name']}/{record['conformer_name']}"
+        )
+        assert pair_embedding.shape[0] == seq_len and pair_embedding.shape[1] == seq_len, (
+            f"pair_embedding shape {pair_embedding.shape[:2]} != ({seq_len}, {seq_len}) "
+            f"for {record['cluster_name']}/{record['conformer_name']}"
+        )
         return {
-            "single_embedding": torch.from_numpy(np.load(single_path).astype(np.float32)),
-            "pair_embedding": torch.from_numpy(np.load(pair_path).astype(np.float32)),
+            "single_embedding": single_embedding,
+            "pair_embedding": pair_embedding,
         }
 
     @staticmethod

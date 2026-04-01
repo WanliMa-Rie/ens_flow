@@ -11,7 +11,6 @@ Returns:
 """
 
 import argparse
-import collections
 import json
 import os
 import pathlib
@@ -20,15 +19,14 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from Bio import PDB
+from Bio import SeqIO
 from Bio.PDB import MMCIFParser
 from tqdm import tqdm
 
 from rna_backbone_design.analysis.metrics import pairwise_rmsd_matrix
 from rna_backbone_design.data import data_transforms
 from rna_backbone_design.data import nucleotide_constants as nc
-from rna_backbone_design.data import parsers
-from rna_backbone_design.data import utils as du
+from rna_backbone_design.data import vocabulary
 from rna_backbone_design.data.rigid_utils import Rigid
 
 
@@ -60,6 +58,12 @@ def parse_args():
     parser.add_argument("--split_val_fraction", type=float, default=0.2)
     parser.add_argument("--split_seed", type=int, default=123)
     parser.add_argument(
+        "--full_sequence_fasta",
+        type=str,
+        required=True,
+        help="Path to FASTA file with full sequences. Record IDs must equal cluster_name.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print per-cluster debug info.",
@@ -67,116 +71,113 @@ def parse_args():
     return parser.parse_args()
 
 
-def pdb_to_complex_feats(
-    pdb_path: str,
-) -> Optional[Dict[str, Any]]:
-    """Parse a PDB file into a feature dict identical to what preprocess_ensemble.py
-    would write to a pkl, but without touching disk.
+def load_full_sequences_from_fasta(fasta_path: str) -> Dict[str, str]:
+    """Load full sequences from a FASTA file, keyed by record ID (= cluster_name)."""
+    seqs: Dict[str, str] = {}
+    for record in SeqIO.parse(fasta_path, "fasta"):
+        if record.id in seqs:
+            raise ValueError(f"Duplicate FASTA record ID: {record.id}")
+        seqs[record.id] = str(record.seq).upper()
+    return seqs
 
-    Returns None if the file cannot be parsed.
+
+# FASTA single-letter (upper) to vocabulary aatype index
+
+
+def align_structure_to_full_sequence(
+    cif_path: str,
+    full_sequence: str,
+) -> Dict[str, Any]:
+    """Parse a mmCIF file and align its residues to a full-length FASTA sequence.
+
+    Uses label_seq_id (via auth_residues=False) as the canonical 1-based index
+    into the full sequence. Unsolved positions get zero atom coords and mask.
+
+    Example
+    -------
+    Suppose the FASTA has 25 nucleotides but only positions 5-20 are resolved in
+    the CIF (label_seq_id 5..20, auth_seq_id could be anything):
+
+        full_sequence = "AAAACGUCGAGCUAGCUACGAUACC"  # len=25
+        feats = align_structure_to_full_sequence("rna.cif", full_sequence)
+
+        feats["aatype"]          # shape (25,)  int64
+                                 #   e.g. [21,21,21,21, 22,23,..., 21,21,21,21,22]
+                                 #   positions 0-3 and 20-24 map from FASTA letters
+        feats["atom_positions"]  # shape (25, 23, 3)  float64, centered on solved C4'
+                                 #   rows 0-3 and 20-24 are all zeros (unsolved)
+        feats["atom_mask"]       # shape (25, 23)  float64
+                                 #   rows 0-3 and 20-24 are all zeros
+        feats["atom_deoxy"]      # shape (25,)  bool, True only for DNA residues
+        feats["is_na_residue_mask"]  # shape (25,)  bool, all True
+
+    Returns full-length processed_feats dict.
     """
-    pdb_name = pathlib.Path(pdb_path).stem
-    bio_parser = MMCIFParser(QUIET=True)
+    seq_len = len(full_sequence)
+    pdb_name = pathlib.Path(cif_path).stem
+    bio_parser = MMCIFParser(QUIET=True, auth_residues=False)
+    structure = bio_parser.get_structure(pdb_name, cif_path)
+    model = list(structure.get_models())[0]
+    chain = list(model.get_chains())[0]
 
-    structure = bio_parser.get_structure(pdb_name, pdb_path)
-    struct_chains = list(structure.get_chains())
+    # Encode full sequence aatype from FASTA (unknown letters → 0)
+    aatype = np.zeros(seq_len, dtype=np.int64)
+    for i, letter in enumerate(full_sequence):
+        vocab_letter = letter.lower()
+        if vocab_letter in vocabulary.restype_order:
+            aatype[i] = vocabulary.restype_order[vocab_letter]
 
-    struct_feats: List[Dict[str, Any]] = []
-    na_natype = None
+    # Initialize full-length arrays (unsolved = zeros)
+    num_atoms = nc.compact_atom_type_num  # 23
+    atom_positions = np.zeros((seq_len, num_atoms, 3), dtype=np.float64)
+    atom_mask = np.zeros((seq_len, num_atoms), dtype=np.float64)
+    atom_deoxy = np.zeros(seq_len, dtype=bool)
 
-    for chain in struct_chains:
-        chain_id = str(chain.id)
-        chain_index = du.chain_str_to_int(chain_id.upper())
-        chain_mol = parsers.process_chain_pdb(
-            chain, chain_index, chain_id,
-        )
-        if chain_mol is None:
-            continue
-        if chain_mol[-1]["molecule_type"] != "na":
-            continue
+    # Place each resolved residue at its label_seq_id position
+    occupied = set()
+    for res in chain:
+        resname = res.resname
+        label_seq_id = res.id[1]  # 1-based (auth_residues=False → label_seq_id)
+        idx = label_seq_id - 1    # 0-based position in full sequence
+        occupied.add(idx)
 
-        na_natype = (
-            chain_mol[-2]
-            if na_natype is None
-            else torch.cat((na_natype, chain_mol[-2]), dim=0)
-        )
+        # Fill atom coordinates
+        compact_atom_order = nc.restype_name_to_compact_atom_order[resname]
+        pos = np.zeros((num_atoms, 3), dtype=np.float64)
+        mask = np.zeros(num_atoms, dtype=np.float64)
+        for atom in res:
+            if atom.name not in compact_atom_order:
+                continue
+            atom_idx = compact_atom_order[atom.name]
+            pos[atom_idx] = atom.coord
+            mask[atom_idx] = 1.0
 
-        chain_mol_constants = chain_mol[-1]["molecule_constants"]
-        chain_mol_backbone_atom_name = chain_mol[-1]["molecule_backbone_atom_name"]
-        chain_dict = parsers.macromolecule_outputs_to_dict(chain_mol)
-        chain_dict = du.parse_chain_feats_pdb(
-            chain_feats=chain_dict,
-            molecule_constants=chain_mol_constants,
-            molecule_backbone_atom_name=chain_mol_backbone_atom_name,
-        )
-        struct_feats.append(chain_dict)
+        atom_positions[idx] = pos
+        atom_mask[idx] = mask
 
-    if not struct_feats:
-        return None
+        if hasattr(nc, "deoxy_restypes") and resname in nc.deoxy_restypes:
+            atom_deoxy[idx] = True
 
-    seq_to_entity_id: Dict[tuple, int] = {}
-    grouped_chains: Dict[int, list] = collections.defaultdict(list)
-    for cd in struct_feats:
-        seq = tuple(cd["aatype"])
-        if seq not in seq_to_entity_id:
-            seq_to_entity_id[seq] = len(seq_to_entity_id) + 1
-        grouped_chains[seq_to_entity_id[seq]].append(cd)
+    # Center around backbone (C4') using only solved residues
+    c4_idx = nc.atom_order["C4'"]
+    bb_mask = atom_mask[:, c4_idx]
+    bb_pos = atom_positions[:, c4_idx]
+    bb_center = np.sum(bb_pos, axis=0) / (np.sum(bb_mask) + 1e-5)
+    atom_positions = atom_positions - bb_center[None, None, :]
+    atom_positions = atom_positions * atom_mask[..., None]
 
-    cid = 1
-    for entity_id, group in grouped_chains.items():
-        for sym_id, cd in enumerate(group, start=1):
-            seq_length = len(cd["aatype"])
-            cd["asym_id"] = cid * np.ones(seq_length)
-            cd["sym_id"] = sym_id * np.ones(seq_length)
-            cd["entity_id"] = entity_id * np.ones(seq_length)
-            cid += 1
-
-    complex_feats = du.concat_np_features(struct_feats, add_batch_dim=False)
-    if complex_feats["bb_mask"].sum() < 1.0:
-        return None
-
-    complex_aatype = complex_feats["aatype"]
-    modeled_idx = np.where((complex_aatype != 20) & (complex_aatype != 26))[0]
-    if len(modeled_idx) == 0:
-        return None
-    complex_feats["modeled_idx"] = modeled_idx
-    complex_feats["na_modeled_idx"] = (
-        None if na_natype is None else np.where(na_natype.numpy() != 26)[0]
-    )
-
-    # Add is_na_residue_mask explicitly (used by _processed_to_geometry)
-    mol_enc = complex_feats.get("molecule_type_encoding", None)
-    if mol_enc is not None:
-        complex_feats["is_na_residue_mask"] = (
-            (mol_enc[:, 1] == 1) | (mol_enc[:, 2] == 1)
-        )
-
-    return complex_feats
+    return {
+        "aatype": aatype,
+        "atom_positions": atom_positions,
+        "atom_mask": atom_mask,
+        "atom_deoxy": atom_deoxy,
+        "is_na_residue_mask": np.ones(seq_len, dtype=bool),
+    }
 
 
 # ---------------------------------------------------------------------------
 #  Feature dict → SE(3) geometry for offline conformer records
 # ---------------------------------------------------------------------------
-
-def _trim_to_modeled_idx(processed_feats: Dict[str, Any]) -> Dict[str, Any]:
-    modeled_idx = processed_feats.get("modeled_idx", None)
-    if modeled_idx is None or len(modeled_idx) == 0:
-        return processed_feats
-    min_idx = int(np.min(modeled_idx))
-    max_idx = int(np.max(modeled_idx))
-    full_len = int(np.asarray(processed_feats["aatype"]).shape[0])
-    return {
-        k: (
-            v[min_idx : (max_idx + 1)]
-            if (isinstance(v, np.ndarray) and v.ndim >= 1 and int(v.shape[0]) == full_len)
-            else v
-        )
-        for k, v in processed_feats.items()
-    }
-
-
-def raw_to_processed(raw_feats: Dict[str, Any]) -> Dict[str, Any]:
-    return _trim_to_modeled_idx(du.parse_complex_feats(raw_feats))
 
 
 def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -229,12 +230,24 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     c4_coords = atom27_pos[:, c4_idx]
     bb_coords = atom27_pos[:, bb_atom_idx]
 
+    torsion_angles_sin_cos = na_feats["torsion_angles_sin_cos"][:, :8].float()
+    torsion_angles_mask = na_feats["torsion_angles_mask"][:, :8].float()
+
+    # Normalize unsolved positions: zero geometry, identity rotation
+    unsolved = (res_mask == 0)
+    trans_1[unsolved] = 0.0
+    rotmats_1[unsolved] = torch.eye(3, dtype=rotmats_1.dtype)
+    c4_coords[unsolved] = 0.0
+    bb_coords[unsolved] = 0.0
+    torsion_angles_sin_cos[unsolved] = 0.0
+    torsion_angles_mask[unsolved] = 0.0
+
     return {
         "aatype": aatype,
         "trans_1": trans_1,
         "rotmats_1": rotmats_1,
-        "torsion_angles_sin_cos": na_feats["torsion_angles_sin_cos"][:, :8].float(),
-        "torsion_angles_mask": na_feats["torsion_angles_mask"][:, :8].float(),
+        "torsion_angles_sin_cos": torsion_angles_sin_cos,
+        "torsion_angles_mask": torsion_angles_mask,
         "res_mask": res_mask,
         "is_na_residue_mask": is_na_residue_mask,
         "c4_coords": c4_coords,
@@ -252,6 +265,7 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
 def process_conformers(
     cluster_dir: pathlib.Path,
     split_name: str,
+    full_sequence: str,
     do_rmsd: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
     pdb_files = sorted((cluster_dir / "structure").glob("*.cif"))
@@ -263,10 +277,7 @@ def process_conformers(
     conformers: List[Dict[str, Any]] = []
 
     for pdb_path in pdb_files:
-        complex_feats = pdb_to_complex_feats(str(pdb_path))
-        if complex_feats is None:
-            continue
-        processed = raw_to_processed(complex_feats)
+        processed = align_structure_to_full_sequence(str(pdb_path), full_sequence)
         geom = processed_to_geometry(processed)
 
         conformers.append(
@@ -322,9 +333,12 @@ def main():
         else data_dir / args.split_cache_filename
     )
 
+    full_sequences = load_full_sequences_from_fasta(args.full_sequence_fasta)
+
     print(f"Data dir:   {data_dir}")
     print(f"Output dir: {output_dir}")
     print(f"Using split file: {cluster_split_path}")
+    print(f"FASTA file: {args.full_sequence_fasta} ({len(full_sequences)} sequences)")
 
     payload = json.loads(cluster_split_path.read_text())
     splits = {
@@ -353,9 +367,14 @@ def main():
         t0 = time.time()
 
         for cluster_name in tqdm(split_cluster_names, desc=split_name):
+            if cluster_name not in full_sequences:
+                raise ValueError(
+                    f"Cluster '{cluster_name}' not found in FASTA file"
+                )
             records = process_conformers(
                 cluster_dir=data_dir / cluster_name,
                 split_name=split_name,
+                full_sequence=full_sequences[cluster_name],
                 do_rmsd=do_rmsd,
             )
             if records is None:
