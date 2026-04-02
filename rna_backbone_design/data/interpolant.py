@@ -388,3 +388,56 @@ class Interpolant:
         )
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj, qv
+
+    def rollout_terminal_trans(self, num_batch, num_res, model, amplitude_net, b_norm, context=None):
+        """Stochastic rollout returning terminal translations with grad through amplitude_net.
+
+        Drift model runs in no_grad; amplitude_net retains gradients so L_cov
+        can backprop to ψ.  Only terminal translation positions are returned.
+
+        Args:
+            num_batch: number of independent rollouts (= M for L_cov).
+            num_res: number of residues.
+            model: drift field network (no_grad).
+            amplitude_net: AmplitudeNet (grad enabled).
+            b_norm: [num_batch, num_res] normalized B-factor profile.
+            context: conditioning dict (single_embedding, pair_embedding).
+
+        Returns:
+            trans: [num_batch, num_res, 3] terminal translation positions.
+        """
+        res_mask = torch.ones(num_batch, num_res, device=self._device)
+        trans_t = _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
+        rotmats_t = _uniform_so3(num_batch, num_res, self._device)
+
+        batch = {"res_mask": res_mask}
+        if context is not None:
+            batch["single_embedding"] = context["single_embedding"]
+            batch["pair_embedding"] = context["pair_embedding"]
+
+        ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
+        t_1 = ts[0]
+
+        for t_2 in ts[1:]:
+            batch["trans_t"] = trans_t
+            batch["rotmats_t"] = rotmats_t
+            t = torch.ones((num_batch, 1), device=self._device) * t_1
+            batch["t"] = t
+
+            with torch.no_grad():
+                model_out = model(batch)
+            # Amplitude net WITH gradients for L_cov backprop
+            a_trans, a_rots = amplitude_net(b_norm, t)
+            a_rots = a_rots.detach()  # only translation grad needed
+
+            pred_trans_1 = model_out["pred_trans"]
+            pred_rotmats_1 = model_out["pred_rotmats"]
+            if self._cfg.self_condition:
+                batch["trans_sc"] = pred_trans_1
+
+            d_t = t_2 - t_1
+            trans_t = self._trans_euler_maruyama_step(d_t, t_1, pred_trans_1, trans_t, a_trans)
+            rotmats_t = self._rots_euler_maruyama_step(d_t, t_1, pred_rotmats_1, rotmats_t, a_rots)
+            t_1 = t_2
+
+        return trans_t

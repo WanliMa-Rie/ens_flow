@@ -427,15 +427,15 @@ class FlowModule(LightningModule):
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
 
-        # U-STEER: quadratic variation loss on translation diffusion amplitude
-        # Section 7: Q_i = E[∫ Tr(D_{x,i}) dt] where D_{x,i} = a_{x,ψ}² · I₃
-        # Single-step MC: Q_i ≈ a_{x,ψ}(B̃_i, t)² at uniformly sampled t
-        # Then: b̂_i^{qv} = Norm(log(Q_i + ε)), minimise (b̂_i^{qv} - B̃_i)²
+        # U-STEER diffusion losses (SE3L_diffusion_losses_derivation.md)
         if self._steer_enabled:
             b_norm = du.normalize_b_factors(batch["b_factors"], batch["res_mask"])
-            a_trans, _a_rots = self.amplitude_net(b_norm, noisy_batch["t"])
-            b_hat = du.normalize_b_factors(a_trans ** 2, batch["res_mask"])
             mask = batch["res_mask"]
+
+            # L_qv: quadratic-variation calibration loss (Section 3)
+            # Q_i = E[∫ Tr(D_{x,i}) dt], single-step MC at uniformly sampled t
+            a_trans, _a_rots = self.amplitude_net(b_norm, noisy_batch["t"])
+            b_hat = du.normalize_b_factors(a_trans ** 2, mask)
             qv_loss = ((b_hat - b_norm) ** 2 * mask).sum(dim=-1) / mask.sum(dim=-1)
             qv_loss = qv_loss.mean()
             train_loss = train_loss + self._steer_cfg.loss.qv_weight * qv_loss
@@ -443,6 +443,36 @@ class FlowModule(LightningModule):
                 "train/qv_loss", qv_loss,
                 on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
             )
+
+            # L_cov: terminal empirical covariance calibration loss (Section 6)
+            # M rollouts → empirical Tr(Ĉ_i) → normalize → compare to B̃
+            cov_weight = self._steer_cfg.loss.cov_weight
+            if cov_weight > 0:
+                M = self._steer_cfg.loss.cov_num_rollouts
+                # Use first sample in the batch, expand for M rollouts
+                idx = 0
+                num_res = int(mask[idx].sum().item())
+                sample_b_norm = b_norm[idx:idx+1].expand(M, -1)
+                sample_mask = mask[idx:idx+1].expand(M, -1)
+                context_cov = {
+                    "single_embedding": batch["single_embedding"][idx:idx+1].expand(M, -1, -1),
+                    "pair_embedding": batch["pair_embedding"][idx:idx+1].expand(M, -1, -1, -1),
+                }
+                terminal_trans = self.interpolant.rollout_terminal_trans(
+                    M, num_res, self.model, self.amplitude_net,
+                    sample_b_norm, context=context_cov,
+                )  # [M, num_res, 3]
+                # ŝ_i² = Tr(Ĉ_i) = Σ_d Var_m(x^{(m,i)}_d)
+                mean_trans = terminal_trans.mean(dim=0, keepdim=True)
+                s_sq = ((terminal_trans - mean_trans) ** 2).mean(dim=0).sum(dim=-1)  # [num_res]
+                c_hat = du.normalize_b_factors(s_sq.unsqueeze(0), sample_mask[0:1])
+                target_b = b_norm[idx:idx+1]
+                cov_loss = ((c_hat - target_b) ** 2 * sample_mask[0:1]).sum() / sample_mask[0:1].sum()
+                train_loss = train_loss + cov_weight * cov_loss
+                self._log_scalar(
+                    "train/cov_loss", cov_loss,
+                    on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+                )
 
         self.log(
             "pbar/loss",
