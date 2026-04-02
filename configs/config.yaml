@@ -111,3 +111,18 @@ experiment:
     monitor: train/loss
     mode: min
     every_n_epochs: 20
+
+steer:
+  enabled: false
+  amplitude_net:
+    timestep_embed_dim: 64
+    hidden_dim: 128
+    num_layers: 4
+    kernel_size: 5
+  loss:
+    qv_weight: 1.0
+    cov_weight: 0.0
+    cov_num_rollouts: 4
+  optimizer:
+    lr: 0.0003
+  drift_lr_scale: 0.1
