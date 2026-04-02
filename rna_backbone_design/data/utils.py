@@ -88,6 +88,24 @@ aatype_to_seq = lambda aatype: "".join(
 )
 
 
+def normalize_b_factors(b_factors, mask, eps=1e-6):
+    """Per-molecule z-score normalization of log B-factors.
+
+    Args:
+        b_factors: [B, N] raw or squared-amplitude values.
+        mask: [B, N] residue mask.
+        eps: numerical stability constant.
+
+    Returns:
+        [B, N] normalized values, zero at padded positions.
+    """
+    log_b = torch.log(b_factors.clamp(min=0) + eps)
+    count = mask.sum(dim=-1, keepdim=True)
+    mean = (log_b * mask).sum(dim=-1, keepdim=True) / count
+    var = ((log_b - mean) ** 2 * mask).sum(dim=-1, keepdim=True) / count
+    return (log_b - mean) / (var.sqrt() + eps) * mask
+
+
 def pad(x: np.ndarray, max_len: int, pad_idx=0, use_torch=False, reverse=False):
     """Right pads dimension of numpy array.
 

@@ -178,6 +178,34 @@ class Interpolant:
 
         return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
 
+    def _trans_euler_maruyama_step(self, d_t, t, trans_1, trans_t, a_trans):
+        """Euler-Maruyama step for translations: drift + diffusion.
+
+        Implements: x_{k+1} = x_k + Δt·v_{x,θ} + √Δt · a_{x,ψ} · ξ_k
+        (Section 5, with U_{x,θ}=I)
+        """
+        trans_vf = (trans_1 - trans_t) / (1 - t)
+        noise = torch.randn_like(trans_t)
+        return trans_t + trans_vf * d_t + a_trans[..., None] * noise * d_t.sqrt()
+
+    def _rots_euler_maruyama_step(self, d_t, t, rotmats_1, rotmats_t, a_rots):
+        """Euler-Maruyama step on SO(3): geodesic drift + tangent-space noise.
+
+        Implements: R_{k+1} = R_k exp(Δt·ω_θ + √Δt · a_{R,ψ} · ζ_k)
+        (Section 5, with U_{R,θ}=I)
+        """
+        if self._rots_cfg.sample_schedule == "linear":
+            scaling = 1 / (1 - t)
+        elif self._rots_cfg.sample_schedule == "exp":
+            scaling = self._rots_cfg.exp_rate
+        else:
+            raise ValueError(f"Unknown sample schedule {self._rots_cfg.sample_schedule}")
+        rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
+        noise = torch.randn_like(rot_vf)
+        total_rotvec = scaling * d_t * rot_vf + a_rots[..., None] * noise * d_t.sqrt()
+        delta_rot = so3_utils.rotvec_to_rotmat(total_rotvec)
+        return torch.einsum("...ij,...jk->...ik", rotmats_t, delta_rot)
+
     def sample(self, num_batch, num_res, model, context=None):
         """
         Params:
@@ -273,3 +301,90 @@ class Interpolant:
         )
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
+
+    def sample_stochastic(self, num_batch, num_res, model, amplitude_net, b_norm, context=None):
+        """Stochastic sampling via Euler-Maruyama integration (Section 5).
+
+        Uses separate translation and rotation amplitudes a_{x,ψ} and a_{R,ψ}.
+        Accumulates quadratic variation Q_i on the translation channel
+        (Section 7): Q_i = ∫ Tr(D_{x,i}) dt ≈ 3 · Σ_k a_{x,ψ}^2 · Δt.
+
+        Args:
+            num_batch: number of independent samples.
+            num_res: number of residues.
+            model: drift field network.
+            amplitude_net: AmplitudeNet returning (a_trans, a_rots).
+            b_norm: [num_batch, num_res] normalized B-factor profile.
+            context: conditioning dict (single_embedding, pair_embedding).
+
+        Returns:
+            (atom37_traj, clean_atom37_traj, clean_traj, qv)
+            qv: [num_batch, num_res] accumulated quadratic variation (trans channel).
+        """
+        res_mask = torch.ones(num_batch, num_res, device=self._device)
+        trans_0 = _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
+        rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
+
+        batch = {"res_mask": res_mask}
+        if context is not None:
+            batch["single_embedding"] = context["single_embedding"]
+            batch["pair_embedding"] = context["pair_embedding"]
+
+        ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
+        t_1 = ts[0]
+
+        qv = torch.zeros(num_batch, num_res, device=self._device)
+        prot_traj = [(trans_0, rotmats_0)]
+        clean_traj = []
+
+        for t_2 in ts[1:]:
+            trans_t_1, rotmats_t_1 = prot_traj[-1]
+            batch["trans_t"] = trans_t_1
+            batch["rotmats_t"] = rotmats_t_1
+            t = torch.ones((num_batch, 1), device=self._device) * t_1
+            batch["t"] = t
+
+            with torch.no_grad():
+                model_out = model(batch)
+                a_trans, a_rots = amplitude_net(b_norm, t)
+
+            pred_trans_1 = model_out["pred_trans"]
+            pred_rotmats_1 = model_out["pred_rotmats"]
+            clean_traj.append((pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu()))
+            if self._cfg.self_condition:
+                batch["trans_sc"] = pred_trans_1
+
+            d_t = t_2 - t_1
+            # QV on translation channel: Tr(D_{x,i}) = 3 · a_{x,ψ}²  (U=I, R³)
+            qv += a_trans ** 2 * d_t
+
+            trans_t_2 = self._trans_euler_maruyama_step(d_t, t_1, pred_trans_1, trans_t_1, a_trans)
+            rotmats_t_2 = self._rots_euler_maruyama_step(d_t, t_1, pred_rotmats_1, rotmats_t_1, a_rots)
+            prot_traj.append((trans_t_2, rotmats_t_2))
+            t_1 = t_2
+
+        # Final step
+        t_1 = ts[-1]
+        trans_t_1, rotmats_t_1 = prot_traj[-1]
+        batch["trans_t"] = trans_t_1
+        batch["rotmats_t"] = rotmats_t_1
+        batch["t"] = torch.ones((num_batch, 1), device=self._device) * t_1
+
+        with torch.no_grad():
+            model_out = model(batch)
+
+        pred_trans_1 = model_out["pred_trans"]
+        pred_rotmats_1 = model_out["pred_rotmats"]
+        pred_torsions_1 = model_out["pred_torsions"]
+        clean_traj.append((pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu()))
+        prot_traj.append((pred_trans_1, pred_rotmats_1))
+
+        is_na_residue_mask = torch.ones(num_batch, num_res, device=self._device).bool()
+        atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
+            prot_traj, is_na_residue_mask, pred_torsions_1
+        )
+        clean_atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
+            prot_traj, is_na_residue_mask, pred_torsions_1
+        )
+
+        return atom37_traj_rna, clean_atom37_traj_rna, clean_traj, qv

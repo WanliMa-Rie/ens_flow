@@ -43,6 +43,13 @@ class FlowModule(LightningModule):
         # Set-up interpolant
         self.interpolant = Interpolant(cfg.interpolant)
 
+        # U-STEER: optional stochastic diffusion amplitude
+        self._steer_cfg = getattr(cfg, 'steer', None)
+        self._steer_enabled = self._steer_cfg is not None and self._steer_cfg.enabled
+        if self._steer_enabled:
+            from rna_backbone_design.models.amplitude_net import AmplitudeNet
+            self.amplitude_net = AmplitudeNet(**self._steer_cfg.amplitude_net)
+
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
 
@@ -290,9 +297,19 @@ class FlowModule(LightningModule):
                 "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
             }
 
-            atom37_traj, _, _ = self.interpolant.sample(
-                num_generated, num_res, self.model, context=context
-            )
+            if self._steer_enabled:
+                b_norm = du.normalize_b_factors(
+                    sample["b_factors"].unsqueeze(0).expand(num_generated, -1),
+                    mask.unsqueeze(0).expand(num_generated, -1),
+                )
+                atom37_traj, _, _, _qv = self.interpolant.sample_stochastic(
+                    num_generated, num_res, self.model, self.amplitude_net,
+                    b_norm, context=context,
+                )
+            else:
+                atom37_traj, _, _ = self.interpolant.sample(
+                    num_generated, num_res, self.model, context=context
+                )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]
 
             sample_metrics = {}
@@ -409,6 +426,24 @@ class FlowModule(LightningModule):
         train_loss = (
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
+
+        # U-STEER: quadratic variation loss on translation diffusion amplitude
+        # Section 7: Q_i = E[∫ Tr(D_{x,i}) dt] where D_{x,i} = a_{x,ψ}² · I₃
+        # Single-step MC: Q_i ≈ a_{x,ψ}(B̃_i, t)² at uniformly sampled t
+        # Then: b̂_i^{qv} = Norm(log(Q_i + ε)), minimise (b̂_i^{qv} - B̃_i)²
+        if self._steer_enabled:
+            b_norm = du.normalize_b_factors(batch["b_factors"], batch["res_mask"])
+            a_trans, _a_rots = self.amplitude_net(b_norm, noisy_batch["t"])
+            b_hat = du.normalize_b_factors(a_trans ** 2, batch["res_mask"])
+            mask = batch["res_mask"]
+            qv_loss = ((b_hat - b_norm) ** 2 * mask).sum(dim=-1) / mask.sum(dim=-1)
+            qv_loss = qv_loss.mean()
+            train_loss = train_loss + self._steer_cfg.loss.qv_weight * qv_loss
+            self._log_scalar(
+                "train/qv_loss", qv_loss,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+
         self.log(
             "pbar/loss",
             train_loss,
@@ -431,9 +466,16 @@ class FlowModule(LightningModule):
         return train_loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
-            params=self.model.parameters(), **self._exp_cfg.optimizer
-        )
+        if not self._steer_enabled:
+            return torch.optim.AdamW(
+                params=self.model.parameters(), **self._exp_cfg.optimizer
+            )
+        drift_lr = self._exp_cfg.optimizer.lr * self._steer_cfg.drift_lr_scale
+        param_groups = [
+            {"params": self.model.parameters(), "lr": drift_lr},
+            {"params": self.amplitude_net.parameters(), "lr": self._steer_cfg.optimizer.lr},
+        ]
+        return torch.optim.AdamW(param_groups)
 
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
@@ -468,9 +510,19 @@ class FlowModule(LightningModule):
                 "single_embedding": sample["single_embedding"].repeat(num_generated, 1, 1),
                 "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
             }
-            atom37_traj, _, _ = interpolant.sample(
-                num_generated, num_res, self.model, context=context
-            )
+            if self._steer_enabled:
+                b_norm = du.normalize_b_factors(
+                    sample["b_factors"].unsqueeze(0).expand(num_generated, -1),
+                    mask.unsqueeze(0).expand(num_generated, -1),
+                )
+                atom37_traj, _, _, _qv = interpolant.sample_stochastic(
+                    num_generated, num_res, self.model, self.amplitude_net,
+                    b_norm, context=context,
+                )
+            else:
+                atom37_traj, _, _ = interpolant.sample(
+                    num_generated, num_res, self.model, context=context
+                )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]  # [num_generated, num_res, 3]
 
             # Write PDB files
