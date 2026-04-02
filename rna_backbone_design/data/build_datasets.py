@@ -36,19 +36,19 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="./data",
+        default="/projects/u6bk/wanli/ensemble_dataset",
         help="Root directory containing cluster folders.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./data/preprocessed_data",
+        default="/projects/u6bk/wanli/ensemble_dataset/preprocessed_data",
         help="Directory to save the processed .pt files.",
     )
     parser.add_argument(
         "--cluster_split",
         type=str,
-        default="./data/cdhit_80_split_indices.json",
+        default="/projects/u6bk/wanli/ensemble_dataset/cdhit_80_split_indices.json",
         help="Path to split_cdhit80.json. Defaults to <data_dir>/split_cdhit80.json.",
     )
     parser.add_argument("--split_cache_filename", type=str, default="split_cdhit80.json")

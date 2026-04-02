@@ -1,5 +1,5 @@
 data_cfg:
-  data_dir: /projects/u6bk/wanli/rna_ensemble_data # Path to ensemble data root
+  data_dir: /projects/u6bk/wanli/ensemble_dataset # Path to ensemble data root
   preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data
   batch_size: 16  # 28
   max_batch_size: 12
