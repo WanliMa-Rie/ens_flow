@@ -88,10 +88,12 @@ class Interpolant:
         aligned_nm_1 = aligned_nm_1.reshape(num_batch, num_batch, num_res, 3)
 
         # Compute cost matrix of aligned noise to ground truth
+        # Only sum over resolved (res_mask=1) positions to avoid padding contamination
         batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)
-        cost_matrix = torch.sum(
-            torch.linalg.norm(aligned_nm_0 - aligned_nm_1, dim=-1), dim=-1
-        ) / torch.sum(batch_mask, dim=-1)
+        norms = torch.linalg.norm(aligned_nm_0 - aligned_nm_1, dim=-1)
+        masked_cost = (norms * batch_mask).sum(dim=-1)
+        denom = batch_mask.sum(dim=-1).clamp(min=1)  # avoid div-by-zero for empty masks
+        cost_matrix = masked_cost / denom
         noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
         return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))]
 

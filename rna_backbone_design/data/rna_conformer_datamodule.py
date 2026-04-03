@@ -86,6 +86,7 @@ class RNAConformerDataModule(LightningDataModule):
         self.drop_last = bool(data_cfg.drop_last)
         self.val_ensemble_as_cluster = bool(data_cfg.val_ensemble_as_cluster)
         self.test_ensemble_as_cluster = bool(data_cfg.test_ensemble_as_cluster)
+        self.max_seq_len = int(data_cfg.max_seq_len) if getattr(data_cfg, "max_seq_len", None) is not None else None
 
         self.train_dataset: Optional[RNAConformerDataset] = None
         self.val_ensemble_dataset: Optional[Dataset] = None
@@ -95,8 +96,18 @@ class RNAConformerDataModule(LightningDataModule):
 
     def _make_dataset(self, path: pathlib.Path, split: str, as_cluster: bool = False) -> Dataset:
         if as_cluster:
-            return RNAClusterDataset(path, self.data_dir, split)
-        return RNAConformerDataset(path, self.data_dir, split)
+            return RNAClusterDataset(
+                path,
+                self.data_dir,
+                split,
+                max_seq_len=self.max_seq_len,
+            )
+        return RNAConformerDataset(
+            path,
+            self.data_dir,
+            split,
+            max_seq_len=self.max_seq_len,
+        )
 
     def _make_loader(self, dataset: Dataset, *, shuffle: bool) -> DataLoader:
         return DataLoader(
@@ -134,4 +145,3 @@ class RNAConformerDataModule(LightningDataModule):
             self._make_loader(self.test_ensemble_dataset, shuffle=False),
             self._make_loader(self.test_single_dataset, shuffle=False),
         ]
-

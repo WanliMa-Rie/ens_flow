@@ -172,10 +172,11 @@ class FlowModule(LightningModule):
 
         gt_bb_atoms *= training_cfg.bb_atom_scale / norm_scale[..., None]
         pred_bb_atoms *= training_cfg.bb_atom_scale / norm_scale[..., None]
+        bb_error = torch.nan_to_num((gt_bb_atoms - pred_bb_atoms) ** 2, nan=0.0)
         loss_denom = torch.sum(loss_mask, dim=-1) * n_merged_atoms
         bb_atom_loss = (
             torch.sum(
-                (gt_bb_atoms - pred_bb_atoms) ** 2 * loss_mask[..., None, None],
+                bb_error * loss_mask[..., None, None],
                 dim=(-1, -2, -3),
             )
             / loss_denom
@@ -185,7 +186,8 @@ class FlowModule(LightningModule):
         trans_error = (
             (gt_trans_1 - pred_trans_1) / norm_scale * training_cfg.trans_scale
         )
-        loss_denom = torch.sum(loss_mask, dim=-1) * 3  # 3 frame atoms
+        trans_error = torch.nan_to_num(trans_error, nan=0.0)
+        loss_denom = torch.sum(loss_mask, dim=-1) * 3
         trans_loss = (
             training_cfg.translation_loss_weight
             * torch.sum(trans_error**2 * loss_mask[..., None], dim=(-1, -2))
@@ -194,7 +196,8 @@ class FlowModule(LightningModule):
 
         # Rotation VF loss
         rots_vf_error = (gt_rot_vf - pred_rots_vf) / norm_scale
-        loss_denom = torch.sum(loss_mask, dim=-1) * 3  # 3 frame atoms
+        rots_vf_error = torch.nan_to_num(rots_vf_error, nan=0.0)
+        loss_denom = torch.sum(loss_mask, dim=-1) * 3
         rots_vf_loss = (
             training_cfg.rotation_loss_weights
             * torch.sum(rots_vf_error**2 * loss_mask[..., None], dim=(-1, -2))
@@ -225,12 +228,12 @@ class FlowModule(LightningModule):
         dist_mat_loss = torch.sum(
             (gt_pair_dists - pred_pair_dists) ** 2 * pair_dist_mask, dim=(1, 2)
         )
-        dist_mat_loss /= torch.sum(pair_dist_mask, dim=(1, 2)) - num_res
+        dist_mat_loss /= (torch.sum(pair_dist_mask, dim=(1, 2)) - num_res).clamp(min=1)
 
         # Torsion angles loss
         pred_torsions_1 = pred_torsions_1.reshape(num_batch, num_res, num_torsions, 2)
         gt_torsions_1 = gt_torsions_1.reshape(num_batch, num_res, num_torsions, 2)
-        loss_denom = torch.sum(loss_mask, dim=-1) * 8  # 8 torsion angles
+        loss_denom = torch.sum(loss_mask, dim=-1) * 8
         tors_loss = (
             training_cfg.tors_loss_scale
             * torch.sum(
@@ -253,12 +256,11 @@ class FlowModule(LightningModule):
 
         if torch.isnan(auxiliary_loss).any():
             print("NaN loss in aux_loss")
-            auxiliary_loss = torch.zeros_like(auxiliary_loss).to(se3_vf_loss.device)
+            auxiliary_loss = auxiliary_loss * 0.0
 
         if torch.isnan(se3_vf_loss).any():
-            # raise ValueError('NaN loss encountered')
             print("NaN loss in se3_vf_loss")
-            se3_vf_loss = torch.zeros_like(se3_vf_loss).to(se3_vf_loss.device)
+            se3_vf_loss = se3_vf_loss * 0.0
 
         return {
             "bb_atom_loss": bb_atom_loss,
@@ -288,19 +290,24 @@ class FlowModule(LightningModule):
         batch_metrics = []
 
         for i in range(num_batch):
-            sample = batch[i]
-            mask = sample["is_na_residue_mask"]
-            num_res = int(mask.sum().item())
+            sample = {k: v[i] if hasattr(v, '__getitem__') else v for k, v in batch.items()}
+            na_mask = sample["is_na_residue_mask"].bool()
+            num_res = int(na_mask.sum().item())
+            # Strip padding: na_mask selects the actual nucleotide positions
+            na_single = sample["single_embedding"][na_mask]          # [num_res, d]
+            na_pair = sample["pair_embedding"][na_mask][:, na_mask]  # [num_res, num_res, d]
+            # eval_mask restricts metrics to resolved residues only
+            eval_mask = sample["res_mask"][na_mask].bool()           # [num_res]
 
             context = {
-                "single_embedding": sample["single_embedding"].repeat(num_generated, 1, 1),
-                "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
+                "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
+                "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
 
             if self._steer_enabled:
                 b_norm = du.normalize_b_factors(
-                    sample["b_factors"].unsqueeze(0).expand(num_generated, -1),
-                    mask.unsqueeze(0).expand(num_generated, -1),
+                    sample["b_factors"][na_mask].unsqueeze(0).expand(num_generated, -1),
+                    eval_mask.unsqueeze(0).expand(num_generated, -1),
                 )
                 atom37_traj, _, _, _qv = self.interpolant.sample_stochastic(
                     num_generated, num_res, self.model, self.amplitude_net,
@@ -315,16 +322,16 @@ class FlowModule(LightningModule):
             sample_metrics = {}
 
             if loader_name == "single":
-                gt_c4 = sample["c4_coords"]
+                gt_c4 = sample["c4_coords"][na_mask].unsqueeze(0).to(pred_c4.device)  # [1, num_res, 3]
                 single_result = metrics.compute_single_metrics(
-                    pred_c4, gt_c4, mask
+                    pred_c4, gt_c4, eval_mask.unsqueeze(0).to(pred_c4.device)  # [1, num_res]
                 )
                 sample_metrics["single_rmsd"] = float(single_result["rmsd"])
                 sample_metrics["single_tm_score"] = float(single_result["tm_score"])
 
             elif loader_name == "ensemble":
-                gt_c4_ens = sample["gt_c4_ensemble"]
-                ensemble_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, mask)
+                gt_c4_ens = sample["gt_c4_ensemble"].to(pred_c4.device)
+                ensemble_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, eval_mask.to(pred_c4.device))
                 sample_metrics.update(ensemble_result)
 
             batch_metrics.append(sample_metrics)
@@ -451,7 +458,9 @@ class FlowModule(LightningModule):
                 M = self._steer_cfg.loss.cov_num_rollouts
                 # Use first sample in the batch, expand for M rollouts
                 idx = 0
-                num_res = int(mask[idx].sum().item())
+                # Use full sequence length for generation (is_na_residue_mask),
+                # not res_mask.sum() which would truncate and mismatch b_norm/sample_mask shape
+                num_res = int(batch["is_na_residue_mask"][idx].sum().item())
                 sample_b_norm = b_norm[idx:idx+1].expand(M, -1)
                 sample_mask = mask[idx:idx+1].expand(M, -1)
                 context_cov = {
@@ -523,9 +532,11 @@ class FlowModule(LightningModule):
         outputs = []
 
         for i in range(num_batch):
-            sample = batch[i]
-            mask = sample["is_na_residue_mask"]
-            num_res = int(mask.sum().item())
+            sample = {k: v[i] if hasattr(v, '__getitem__') else v for k, v in batch.items()}
+            na_mask = sample["is_na_residue_mask"].bool()
+            num_res = int(na_mask.sum().item())
+            # Strip padding with na_mask
+            eval_mask = sample["res_mask"][na_mask].bool()           # [num_res]
             cluster_id = str(sample.get("cluster_id", sample.get("cluster_name", "unknown")))
             pdb_name = sample.get("pdb_name", None)
 
@@ -536,14 +547,16 @@ class FlowModule(LightningModule):
             os.makedirs(sample_dir, exist_ok=True)
 
             # Generate samples
+            na_single = sample["single_embedding"][na_mask]
+            na_pair = sample["pair_embedding"][na_mask][:, na_mask]
             context = {
-                "single_embedding": sample["single_embedding"].repeat(num_generated, 1, 1),
-                "pair_embedding": sample["pair_embedding"].repeat(num_generated, 1, 1, 1),
+                "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
+                "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
             if self._steer_enabled:
                 b_norm = du.normalize_b_factors(
-                    sample["b_factors"].unsqueeze(0).expand(num_generated, -1),
-                    mask.unsqueeze(0).expand(num_generated, -1),
+                    sample["b_factors"][na_mask].unsqueeze(0).expand(num_generated, -1),
+                    eval_mask.unsqueeze(0).expand(num_generated, -1).float(),
                 )
                 atom37_traj, _, _, _qv = interpolant.sample_stochastic(
                     num_generated, num_res, self.model, self.amplitude_net,
@@ -564,19 +577,19 @@ class FlowModule(LightningModule):
                     is_na_residue_mask=is_na,
                 )
 
-            # GT C4' coords
-            gt_torsions = sample["torsion_angles_sin_cos"][:, :8, :].reshape(1, -1, 16)
+            # GT C4' coords (strip padding with na_mask)
+            gt_torsions = sample["torsion_angles_sin_cos"][na_mask][:, :8, :].reshape(1, -1, 16)
             gt_atoms = rna_all_atom.to_atom37_rna(
-                sample["trans_1"].unsqueeze(0),
-                sample["rotmats_1"].unsqueeze(0),
-                mask.unsqueeze(0).bool(),
+                sample["trans_1"][na_mask].unsqueeze(0),
+                sample["rotmats_1"][na_mask].unsqueeze(0),
+                eval_mask.unsqueeze(0),
                 torsions=gt_torsions,
             )
             gt_c4 = gt_atoms[:, :, c4_idx]  # [1, num_res, 3]
 
             # Single metrics (best RMSD/TM across all generated)
             single_result = metrics.compute_single_metrics(
-                pred_c4, gt_c4, mask.unsqueeze(0)
+                pred_c4, gt_c4, eval_mask.unsqueeze(0)
             )
 
             out_row = {
@@ -592,7 +605,7 @@ class FlowModule(LightningModule):
             if ensemble_enabled and num_generated >= 2:
                 gt_c4_ens = sample.get("gt_c4_ensemble", None)
                 if gt_c4_ens is not None:
-                    ens_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, mask)
+                    ens_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, eval_mask)
                     out_row.update(ens_result)
 
             outputs.append(out_row)

@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--cluster_split",
         type=str,
-        default="/projects/u6bk/wanli/ensemble_dataset/cdhit_80_split_indices.json",
+        default="/projects/u6bk/wanli/ensemble_dataset/split_cdhit80.json",
         help="Path to split_cdhit80.json. Defaults to <data_dir>/split_cdhit80.json.",
     )
     parser.add_argument("--split_cache_filename", type=str, default="split_cdhit80.json")
@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument(
         "--full_sequence_fasta",
         type=str,
-        required=True,
+        default="/projects/u6bk/wanli/ensemble_dataset/all_sequences.fasta",
         help="Path to FASTA file with full sequences. Record IDs must equal cluster_name.",
     )
     parser.add_argument(
@@ -119,8 +119,9 @@ def align_structure_to_full_sequence(
     model = list(structure.get_models())[0]
     chain = list(model.get_chains())[0]
 
-    # Encode full sequence aatype from FASTA (unknown letters → 0)
-    aatype = np.zeros(seq_len, dtype=np.int64)
+    # Encode full sequence aatype from FASTA (unknown letters → 'x' = 26)
+    unk_idx = vocabulary.restype_order['x']
+    aatype = np.full(seq_len, unk_idx, dtype=np.int64)
     for i, letter in enumerate(full_sequence):
         vocab_letter = letter.lower()
         if vocab_letter in vocabulary.restype_order:
@@ -141,7 +142,9 @@ def align_structure_to_full_sequence(
         idx = label_seq_id - 1    # 0-based position in full sequence
         occupied.add(idx)
 
-        # Fill atom coordinates
+        # Fill atom coordinates (skip non-standard residues)
+        if resname not in nc.restype_name_to_compact_atom_order:
+            continue
         compact_atom_order = nc.restype_name_to_compact_atom_order[resname]
         pos = np.zeros((num_atoms, 3), dtype=np.float64)
         mask = np.zeros(num_atoms, dtype=np.float64)

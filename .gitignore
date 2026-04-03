@@ -15,6 +15,7 @@ AGENTS.md
 core
 tests/
 scripts/**
+ens_flow/**
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files

@@ -1,26 +1,20 @@
 data_cfg:
   data_dir: /projects/u6bk/wanli/ensemble_dataset # Path to ensemble data root
   preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data
-  batch_size: 16  # 28
-  max_batch_size: 12
+  batch_size: 8  # 28
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   drop_last: false
-  posterior_nearest_p: 0
-  embedding_cache_size: 4
   val_ensemble_as_cluster: true
   test_ensemble_as_cluster: true
+  max_seq_len: 300
 
 interpolant:
   min_t: 1e-2
   rots:
-    train_schedule: linear
     sample_schedule: exp
     exp_rate: 10
-  trans:
-    train_schedule: linear
-    sample_schedule: linear
   sampling:
     num_timesteps: 60
   self_condition: ${model.edge_features.self_condition}
@@ -28,23 +22,15 @@ interpolant:
 model:
   node_embed_size: 256
   edge_embed_size: 128
-  symmetric: False
   node_features:
     c_s: ${model.node_embed_size}
     c_pos_emb: 128
     c_timestep_emb: 128
     c_single_in: 384
-    embed_diffuse_mask: False
-    max_num_res: 2000
-    timestep_int: 1000
   edge_features:
-    single_bias_transition_n: 2
     c_s: ${model.node_embed_size}
     c_p: ${model.edge_embed_size}
     c_pair_in: 128
-    relpos_k: 64
-    use_rbf: True
-    num_rbf: 32
     feat_dim: 64
     num_bins: 22
     self_condition: True
@@ -61,13 +47,6 @@ model:
 
 experiment:
   seed: 123
-  num_devices: 4
-  use_swa: False
-  batch_ot:
-    enabled: True
-    cost: kabsch
-    noise_per_sample: 1
-    permute: False
   training:
     loss: se3_vf_loss
     bb_atom_scale: 0.1
@@ -80,13 +59,10 @@ experiment:
     tors_loss_scale: 1.0
     num_non_frame_atoms: 0 # choose from [0, 3, 7]
   validation:
-    num_generated: 150
-    ensemble:
-      max_batches: 5
-      num_gt: 20
+    num_generated: 100
   wandb:
     name: baseline
-    project: velmix
+    project: ens_flow
     save_code: false
     tags: []
     mode: "online" # can also save to `offline`
@@ -106,11 +82,6 @@ experiment:
     accumulate_grad_batches: 1
   checkpointer:
     dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
-    save_last: True
-    save_top_k: 3
-    monitor: train/loss
-    mode: min
-    every_n_epochs: 20
 
 steer:
   enabled: false
