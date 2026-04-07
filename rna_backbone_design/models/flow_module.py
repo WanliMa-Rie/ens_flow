@@ -23,8 +23,10 @@ from rna_backbone_design.data.interpolant import Interpolant
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.data import all_atom as rna_all_atom
 from rna_backbone_design.data import so3_utils
+from scipy.spatial.transform import Rotation
 from rna_backbone_design.data import nucleotide_constants
 from rna_backbone_design.analysis import utils as au
+from rna_backbone_design.data import fk_utils
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 
@@ -43,12 +45,13 @@ class FlowModule(LightningModule):
         # Set-up interpolant
         self.interpolant = Interpolant(cfg.interpolant)
 
-        # U-STEER: optional stochastic diffusion amplitude
-        self._steer_cfg = getattr(cfg, 'steer', None)
-        self._steer_enabled = self._steer_cfg is not None and self._steer_cfg.enabled
-        if self._steer_enabled:
-            from rna_backbone_design.models.amplitude_net import AmplitudeNet
-            self.amplitude_net = AmplitudeNet(**self._steer_cfg.amplitude_net)
+        # fk_flow: optional stochastic diffusion amplitude with Feynman-Kac framework
+        self._fk_cfg = getattr(cfg, 'fk_flow', None)
+        self._fk_enabled = self._fk_cfg is not None and self._fk_cfg.enabled
+        if self._fk_enabled:
+            from rna_backbone_design.models.amplitude_net import AmplitudeNet, UncertaintyNet
+            self.amplitude_net = AmplitudeNet(**self._fk_cfg.amplitude_net)
+            self.uncertainty_net = UncertaintyNet(**self._fk_cfg.uncertainty_net)
 
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
@@ -304,14 +307,10 @@ class FlowModule(LightningModule):
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
 
-            if self._steer_enabled:
-                b_norm = du.normalize_b_factors(
-                    sample["b_factors"][na_mask].unsqueeze(0).expand(num_generated, -1),
-                    eval_mask.unsqueeze(0).expand(num_generated, -1),
-                )
-                atom37_traj, _, _, _qv = self.interpolant.sample_stochastic(
+            if self._fk_enabled:
+                atom37_traj, _, _ = self.interpolant.sample_stochastic(
                     num_generated, num_res, self.model, self.amplitude_net,
-                    b_norm, context=context,
+                    context=context,
                 )
             else:
                 atom37_traj, _, _ = self.interpolant.sample(
@@ -396,6 +395,7 @@ class FlowModule(LightningModule):
 
         batch_losses = self.model_step(noisy_batch)
         num_batch = batch_losses["bb_atom_loss"].shape[0]
+        num_res = batch["res_mask"].shape[1]
         total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
 
         for k, v in total_losses.items():
@@ -434,54 +434,10 @@ class FlowModule(LightningModule):
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
 
-        # U-STEER diffusion losses (SE3L_diffusion_losses_derivation.md)
-        if self._steer_enabled:
-            b_norm = du.normalize_b_factors(batch["b_factors"], batch["res_mask"])
-            mask = batch["res_mask"]
-
-            # L_qv: quadratic-variation calibration loss (Section 3)
-            # Q_i = E[∫ Tr(D_{x,i}) dt], single-step MC at uniformly sampled t
-            a_trans, _a_rots = self.amplitude_net(b_norm, noisy_batch["t"])
-            b_hat = du.normalize_b_factors(a_trans ** 2, mask)
-            qv_loss = ((b_hat - b_norm) ** 2 * mask).sum(dim=-1) / mask.sum(dim=-1)
-            qv_loss = qv_loss.mean()
-            train_loss = train_loss + self._steer_cfg.loss.qv_weight * qv_loss
-            self._log_scalar(
-                "train/qv_loss", qv_loss,
-                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
-            )
-
-            # L_cov: terminal empirical covariance calibration loss (Section 6)
-            # M rollouts → empirical Tr(Ĉ_i) → normalize → compare to B̃
-            cov_weight = self._steer_cfg.loss.cov_weight
-            if cov_weight > 0:
-                M = self._steer_cfg.loss.cov_num_rollouts
-                # Use first sample in the batch, expand for M rollouts
-                idx = 0
-                # Use full sequence length for generation (is_na_residue_mask),
-                # not res_mask.sum() which would truncate and mismatch b_norm/sample_mask shape
-                num_res = int(batch["is_na_residue_mask"][idx].sum().item())
-                sample_b_norm = b_norm[idx:idx+1].expand(M, -1)
-                sample_mask = mask[idx:idx+1].expand(M, -1)
-                context_cov = {
-                    "single_embedding": batch["single_embedding"][idx:idx+1].expand(M, -1, -1),
-                    "pair_embedding": batch["pair_embedding"][idx:idx+1].expand(M, -1, -1, -1),
-                }
-                terminal_trans = self.interpolant.rollout_terminal_trans(
-                    M, num_res, self.model, self.amplitude_net,
-                    sample_b_norm, context=context_cov,
-                )  # [M, num_res, 3]
-                # ŝ_i² = Tr(Ĉ_i) = Σ_d Var_m(x^{(m,i)}_d)
-                mean_trans = terminal_trans.mean(dim=0, keepdim=True)
-                s_sq = ((terminal_trans - mean_trans) ** 2).mean(dim=0).sum(dim=-1)  # [num_res]
-                c_hat = du.normalize_b_factors(s_sq.unsqueeze(0), sample_mask[0:1])
-                target_b = b_norm[idx:idx+1]
-                cov_loss = ((c_hat - target_b) ** 2 * sample_mask[0:1]).sum() / sample_mask[0:1].sum()
-                train_loss = train_loss + cov_weight * cov_loss
-                self._log_scalar(
-                    "train/cov_loss", cov_loss,
-                    on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
-                )
+        # Feynman-Kac B-factor supervision (§4 of bfactor_frameworks.md)
+        if self._fk_enabled:
+            fk_loss = self._feynman_kac_step(batch, noisy_batch, num_batch)
+            train_loss = train_loss + fk_loss
 
         self.log(
             "pbar/loss",
@@ -504,15 +460,117 @@ class FlowModule(LightningModule):
 
         return train_loss
 
+    def _feynman_kac_step(self, batch, noisy_batch, num_batch):
+        """Compute Feynman-Kac losses: L_TD + L_term + L_init.
+
+        Samples two timesteps t1 < t2, interpolates states, and enforces
+        temporal consistency of the uncertainty value function U_j(t).
+
+        Key constraint: q_j ≥ 0 ⟹ U is non-increasing ⟹ U(0) ≥ 0.
+        Therefore B-factor targets must be non-negative (positive normalization).
+        """
+        fk_cfg = self._fk_cfg.loss
+        device = batch["res_mask"].device
+        num_res = batch["res_mask"].shape[1]
+        single_emb = batch["single_embedding"]
+        res_mask = batch["res_mask"]  # [B, N]
+
+        # Frame atom B-factor targets: C4'=3, O4'=6, C3'=2 in compact-23
+        atom_b = batch["atom_b_factors"]          # [B, N, 23]
+        atom_mask = batch["atom_mask_compact"]     # [B, N, 23]
+        frame_atom_idx = [3, 6, 2]  # C4', O4', C3'
+        frame_b = atom_b[:, :, frame_atom_idx]     # [B, N, 3]
+        frame_mask = atom_mask[:, :, frame_atom_idx]  # [B, N, 3]
+        valid_mask = frame_mask * res_mask[..., None]  # [B, N, 3]
+
+        # Positive normalization: U(0) ≥ 0 required by monotonicity
+        b_target = fk_utils.normalize_b_factors_positive(frame_b, frame_mask)
+
+        # Reuse the batch's interpolated state as t1
+        trans_1 = batch["trans_1"]
+        rotmats_1 = batch["rotmats_1"]
+        trans_t1 = noisy_batch["trans_t"]
+        rotmats_t1 = noisy_batch["rotmats_t"]
+        t1 = noisy_batch["t"]  # [B, 1]
+
+        # t2 uniformly in (t1, 1), clamped away from boundary
+        t2_raw = torch.rand(num_batch, device=device)
+        t2 = t1[:, 0] + (1.0 - t1[:, 0]) * t2_raw
+        t2 = t2.clamp(max=1.0 - 1e-3)[:, None]  # [B, 1]
+
+        # Interpolate t2 state from t1 toward x1
+        frac = ((t2 - t1) / (1 - t1)).clamp(min=0, max=1)
+        trans_t2 = trans_t1 + frac[..., None] * (trans_1 - trans_t1)
+        rotmats_t2 = so3_utils.geodesic_t(frac[..., None], rotmats_1, rotmats_t1)
+
+        # AmplitudeNet: instantaneous diffusion rates at t1 and t2
+        sigma_x_1, s1_1, s2_1, s3_1 = self.amplitude_net(
+            trans_t1, rotmats_t1, single_emb, t1
+        )
+        sigma_x_2, s1_2, s2_2, s3_2 = self.amplitude_net(
+            trans_t2, rotmats_t2, single_emb, t2
+        )
+
+        q_t1 = fk_utils.compute_frame_atom_trace_aniso(
+            sigma_x_1, s1_1, s2_1, s3_1, device
+        )  # [B, N, 3]
+        q_t2 = fk_utils.compute_frame_atom_trace_aniso(
+            sigma_x_2, s1_2, s2_2, s3_2, device
+        )  # [B, N, 3]
+
+        # UncertaintyNet: value function at t1 and t2
+        U_t1 = self.uncertainty_net(trans_t1, rotmats_t1, single_emb, t1)
+        U_t2 = self.uncertainty_net(trans_t2, rotmats_t2, single_emb, t2)
+
+        # --- Loss 1: TD temporal consistency (semi-gradient) ---
+        # U(t1) - U(t2) ≈ q̄ · Δt, detach bootstrap target for stability
+        dt = t2 - t1  # [B, 1]
+        q_bar = 0.5 * (q_t1 + q_t2)  # [B, N, 3]
+        td_target = (U_t2.detach() + q_bar.detach() * dt[..., None])
+        td_loss = ((U_t1 - td_target) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+
+        # --- Loss 2: Terminal condition U(1) = 0 ---
+        t_one = torch.ones(num_batch, 1, device=device)
+        U_term = self.uncertainty_net(trans_1, rotmats_1, single_emb, t_one)
+        term_loss = (U_term ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+
+        # --- Loss 3: Initial condition U(0) = B_norm (positive) ---
+        t_zero = torch.full((num_batch, 1), self._interpolant_cfg.min_t, device=device)
+        # Sample from the actual prior distribution
+        noise = torch.randn(num_batch, num_res, 3, device=device)
+        trans_t0 = (noise - noise.mean(dim=1, keepdim=True)) * du.NM_TO_ANG_SCALE
+        rotmats_t0 = torch.tensor(
+            Rotation.random(num_batch * num_res).as_matrix(),
+            device=device, dtype=torch.float32,
+        ).reshape(num_batch, num_res, 3, 3)
+        U_init = self.uncertainty_net(trans_t0, rotmats_t0, single_emb, t_zero)
+        init_loss = ((U_init - b_target) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+
+        # Total FK loss
+        fk_loss = (
+            fk_cfg.td_weight * td_loss
+            + fk_cfg.term_weight * term_loss
+            + fk_cfg.init_weight * init_loss
+        )
+
+        for name, val in [("td_loss", td_loss), ("term_loss", term_loss), ("init_loss", init_loss)]:
+            self._log_scalar(
+                f"train/fk_{name}", val,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+
+        return fk_loss
+
     def configure_optimizers(self):
-        if not self._steer_enabled:
+        if not self._fk_enabled:
             return torch.optim.AdamW(
                 params=self.model.parameters(), **self._exp_cfg.optimizer
             )
-        drift_lr = self._exp_cfg.optimizer.lr * self._steer_cfg.drift_lr_scale
+        drift_lr = self._exp_cfg.optimizer.lr * self._fk_cfg.drift_lr_scale
         param_groups = [
             {"params": self.model.parameters(), "lr": drift_lr},
-            {"params": self.amplitude_net.parameters(), "lr": self._steer_cfg.optimizer.lr},
+            {"params": self.amplitude_net.parameters(), "lr": self._fk_cfg.optimizer.lr},
+            {"params": self.uncertainty_net.parameters(), "lr": self._fk_cfg.optimizer.lr},
         ]
         return torch.optim.AdamW(param_groups)
 
@@ -553,14 +611,10 @@ class FlowModule(LightningModule):
                 "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
-            if self._steer_enabled:
-                b_norm = du.normalize_b_factors(
-                    sample["b_factors"][na_mask].unsqueeze(0).expand(num_generated, -1),
-                    eval_mask.unsqueeze(0).expand(num_generated, -1).float(),
-                )
-                atom37_traj, _, _, _qv = interpolant.sample_stochastic(
+            if self._fk_enabled:
+                atom37_traj, _, _ = interpolant.sample_stochastic(
                     num_generated, num_res, self.model, self.amplitude_net,
-                    b_norm, context=context,
+                    context=context,
                 )
             else:
                 atom37_traj, _, _ = interpolant.sample(

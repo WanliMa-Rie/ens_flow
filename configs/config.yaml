@@ -1,7 +1,7 @@
 data_cfg:
   data_dir: /projects/u6bk/wanli/ensemble_dataset # Path to ensemble data root
   preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data
-  batch_size: 8  # 28
+  batch_size: 10  # 28
   num_workers: 4
   pin_memory: true
   persistent_workers: true
@@ -43,7 +43,7 @@ model:
     no_v_points: 12
     seq_tfmr_num_heads: 4
     seq_tfmr_num_layers: 2
-    num_blocks: 4   # 6
+    num_blocks: 5   # 6
 
 experiment:
   seed: 123
@@ -59,7 +59,7 @@ experiment:
     tors_loss_scale: 1.0
     num_non_frame_atoms: 0 # choose from [0, 3, 7]
   validation:
-    num_generated: 100
+    num_generated: 50
   wandb:
     name: baseline
     project: ens_flow
@@ -77,23 +77,31 @@ experiment:
     accelerator: gpu
     log_every_n_steps: 1
     deterministic: False
-    strategy: ddp
+    strategy: ddp_find_unused_parameters_true
     check_val_every_n_epoch: 10
+    num_sanity_val_steps: 0
     accumulate_grad_batches: 1
   checkpointer:
     dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
 
-steer:
-  enabled: false
+fk_flow:
+  enabled: true
   amplitude_net:
+    c_single_in: ${model.node_features.c_single_in}  # 384
+    timestep_embed_dim: 64
+    hidden_dim: 128
+    num_layers: 4
+    kernel_size: 5
+  uncertainty_net:
+    c_single_in: ${model.node_features.c_single_in}  # 384
     timestep_embed_dim: 64
     hidden_dim: 128
     num_layers: 4
     kernel_size: 5
   loss:
-    qv_weight: 1.0
-    cov_weight: 0.0
-    cov_num_rollouts: 4
+    td_weight: 1.0
+    term_weight: 1.0
+    init_weight: 1.0
   optimizer:
     lr: 0.0003
   drift_lr_scale: 0.1
