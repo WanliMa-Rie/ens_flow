@@ -241,8 +241,12 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     torsion_angles_sin_cos = na_feats["torsion_angles_sin_cos"][:, :8].float()
     torsion_angles_mask = na_feats["torsion_angles_mask"][:, :8].float()
 
-    # Per-residue B-factor from C4' atom
+    # Per-residue B-factor from C4' atom (backward compat)
     b_factors = atom_b_factors[:, c4_idx]
+
+    # Atom-wise B-factors and mask in compact 23-atom format
+    atom_b_factors_compact = atom_b_factors[:, :num_na_atoms].float()
+    atom_mask_compact = atom_mask[:, :num_na_atoms].float()
 
     # Normalize unsolved positions: zero geometry, identity rotation
     unsolved = (res_mask == 0)
@@ -253,6 +257,8 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     torsion_angles_sin_cos[unsolved] = 0.0
     torsion_angles_mask[unsolved] = 0.0
     b_factors[unsolved] = 0.0
+    atom_b_factors_compact[unsolved] = 0.0
+    atom_mask_compact[unsolved] = 0.0
 
     return {
         "aatype": aatype,
@@ -265,6 +271,8 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
         "c4_coords": c4_coords,
         "bb_coords": bb_coords,
         "b_factors": b_factors,
+        "atom_b_factors": atom_b_factors_compact,
+        "atom_mask_compact": atom_mask_compact,
     }
 
 
@@ -308,6 +316,8 @@ def process_conformers(
                 "c4_coords": geom["c4_coords"],
                 "bb_coords": geom["bb_coords"],
                 "b_factors": geom["b_factors"],
+                "atom_b_factors": geom["atom_b_factors"],
+                "atom_mask_compact": geom["atom_mask_compact"],
             }
         )
 
