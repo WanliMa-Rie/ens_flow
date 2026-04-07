@@ -463,11 +463,9 @@ class FlowModule(LightningModule):
     def _feynman_kac_step(self, batch, noisy_batch, num_batch):
         """Compute Feynman-Kac losses: L_TD + L_term + L_init.
 
-        Samples two timesteps t1 < t2, interpolates states, and enforces
-        temporal consistency of the uncertainty value function U_j(t).
-
-        Key constraint: q_j ≥ 0 ⟹ U is non-increasing ⟹ U(0) ≥ 0.
-        Therefore B-factor targets must be non-negative (positive normalization).
+        Per-residue scalar U_i(t) tracks remaining flexibility budget.
+        q_i = σ_x² + σ_ω² is the instantaneous rate (model decides the split).
+        B-factor target is per-nucleotide average.
         """
         fk_cfg = self._fk_cfg.loss
         device = batch["res_mask"].device
@@ -475,16 +473,9 @@ class FlowModule(LightningModule):
         single_emb = batch["single_embedding"]
         res_mask = batch["res_mask"]  # [B, N]
 
-        # Frame atom B-factor targets: C4'=3, O4'=6, C3'=2 in compact-23
-        atom_b = batch["atom_b_factors"]          # [B, N, 23]
-        atom_mask = batch["atom_mask_compact"]     # [B, N, 23]
-        frame_atom_idx = [3, 6, 2]  # C4', O4', C3'
-        frame_b = atom_b[:, :, frame_atom_idx]     # [B, N, 3]
-        frame_mask = atom_mask[:, :, frame_atom_idx]  # [B, N, 3]
-        valid_mask = frame_mask * res_mask[..., None]  # [B, N, 3]
-
-        # Positive normalization: U(0) ≥ 0 required by monotonicity
-        b_target = fk_utils.normalize_b_factors_positive(frame_b, frame_mask)
+        # Per-residue average B-factor target
+        b_factors = batch["b_factors"]  # [B, N] (per-residue, e.g. C4' or average)
+        b_target = fk_utils.normalize_b_factors_positive(b_factors, res_mask)  # [B, N]
 
         # Reuse the batch's interpolated state as t1
         trans_1 = batch["trans_1"]
@@ -493,7 +484,7 @@ class FlowModule(LightningModule):
         rotmats_t1 = noisy_batch["rotmats_t"]
         t1 = noisy_batch["t"]  # [B, 1]
 
-        # t2 uniformly in (t1, 1), clamped away from boundary
+        # t2 uniformly in (t1, 1)
         t2_raw = torch.rand(num_batch, device=device)
         t2 = t1[:, 0] + (1.0 - t1[:, 0]) * t2_raw
         t2 = t2.clamp(max=1.0 - 1e-3)[:, None]  # [B, 1]
@@ -503,40 +494,29 @@ class FlowModule(LightningModule):
         trans_t2 = trans_t1 + frac[..., None] * (trans_1 - trans_t1)
         rotmats_t2 = so3_utils.geodesic_t(frac[..., None], rotmats_1, rotmats_t1)
 
-        # AmplitudeNet: instantaneous diffusion rates at t1 and t2
-        sigma_x_1, s1_1, s2_1, s3_1 = self.amplitude_net(
-            trans_t1, rotmats_t1, single_emb, t1
-        )
-        sigma_x_2, s1_2, s2_2, s3_2 = self.amplitude_net(
-            trans_t2, rotmats_t2, single_emb, t2
-        )
+        # AmplitudeNet → instantaneous flexibility rate q = σ_x² + σ_ω²
+        sx1, sw1 = self.amplitude_net(trans_t1, rotmats_t1, single_emb, t1)
+        sx2, sw2 = self.amplitude_net(trans_t2, rotmats_t2, single_emb, t2)
+        q_t1 = fk_utils.compute_flexibility_rate(sx1, sw1)  # [B, N]
+        q_t2 = fk_utils.compute_flexibility_rate(sx2, sw2)  # [B, N]
 
-        q_t1 = fk_utils.compute_frame_atom_trace_aniso(
-            sigma_x_1, s1_1, s2_1, s3_1, device
-        )  # [B, N, 3]
-        q_t2 = fk_utils.compute_frame_atom_trace_aniso(
-            sigma_x_2, s1_2, s2_2, s3_2, device
-        )  # [B, N, 3]
+        # UncertaintyNet → remaining budget U_i(t)
+        U_t1 = self.uncertainty_net(trans_t1, rotmats_t1, single_emb, t1)  # [B, N]
+        U_t2 = self.uncertainty_net(trans_t2, rotmats_t2, single_emb, t2)  # [B, N]
 
-        # UncertaintyNet: value function at t1 and t2
-        U_t1 = self.uncertainty_net(trans_t1, rotmats_t1, single_emb, t1)
-        U_t2 = self.uncertainty_net(trans_t2, rotmats_t2, single_emb, t2)
-
-        # --- Loss 1: TD temporal consistency (semi-gradient) ---
-        # U(t1) - U(t2) ≈ q̄ · Δt, detach bootstrap target for stability
+        # --- L_TD: semi-gradient temporal consistency ---
         dt = t2 - t1  # [B, 1]
-        q_bar = 0.5 * (q_t1 + q_t2)  # [B, N, 3]
-        td_target = (U_t2.detach() + q_bar.detach() * dt[..., None])
-        td_loss = ((U_t1 - td_target) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+        q_bar = 0.5 * (q_t1 + q_t2)  # [B, N]
+        td_target = (U_t2.detach() + q_bar.detach() * dt)
+        td_loss = ((U_t1 - td_target) ** 2 * res_mask).sum() / res_mask.sum().clamp(min=1)
 
-        # --- Loss 2: Terminal condition U(1) = 0 ---
+        # --- L_term: U(1) = 0 ---
         t_one = torch.ones(num_batch, 1, device=device)
         U_term = self.uncertainty_net(trans_1, rotmats_1, single_emb, t_one)
-        term_loss = (U_term ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+        term_loss = (U_term ** 2 * res_mask).sum() / res_mask.sum().clamp(min=1)
 
-        # --- Loss 3: Initial condition U(0) = B_norm (positive) ---
+        # --- L_init: U(0) = B_norm ---
         t_zero = torch.full((num_batch, 1), self._interpolant_cfg.min_t, device=device)
-        # Sample from the actual prior distribution
         noise = torch.randn(num_batch, num_res, 3, device=device)
         trans_t0 = (noise - noise.mean(dim=1, keepdim=True)) * du.NM_TO_ANG_SCALE
         rotmats_t0 = torch.tensor(
@@ -544,9 +524,9 @@ class FlowModule(LightningModule):
             device=device, dtype=torch.float32,
         ).reshape(num_batch, num_res, 3, 3)
         U_init = self.uncertainty_net(trans_t0, rotmats_t0, single_emb, t_zero)
-        init_loss = ((U_init - b_target) ** 2 * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+        init_loss = ((U_init - b_target) ** 2 * res_mask).sum() / res_mask.sum().clamp(min=1)
 
-        # Total FK loss
+        # Total
         fk_loss = (
             fk_cfg.td_weight * td_loss
             + fk_cfg.term_weight * term_loss

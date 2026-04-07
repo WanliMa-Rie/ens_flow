@@ -1,197 +1,223 @@
-# Architecture Report: Feynman-Kac B-factor Supervision for SE(3) Flow Matching
+# 架构报告：TD-Flow — 基于 Feynman-Kac 框架的 B-factor 监督 SE(3) 随机桥
 
-## Overview
+## 概述
 
-This report documents the implementation of the Feynman-Kac cumulative uncertainty framework for B-factor supervision in the RNA backbone generative model. The framework replaces the previous isotropic steer losses (L_qv, L_cov) with a mathematically rigorous path-integral formulation that aligns accumulated generative uncertainty with experimental B-factors.
+本报告描述了 TD-Flow 模型的实现细节。该模型在 RNA 骨架生成的 SE(3) 流匹配框架之上，引入了随机扩散模块，利用实验 B-factor 监督每个核苷酸在生成轨迹中的柔性预算。
 
-## Design Principles
+核心设计思想：将 B-factor 视为生成过程中从噪声到结构的**路径积分总不确定度**，而非单步快照。通过 TD（时序差分）学习风格的训练，避免了昂贵的完整轨迹展开。
 
-1. **Genuine path accumulation** — B-factor is modeled as a total uncertainty budget over the generative trajectory, not a per-step snapshot
-2. **Anisotropic SE(3) diffusion** — Rotation noise is direction-dependent (3 independent axes), resolving the O4'/C3' degeneracy inherent in isotropic models
-3. **TD-learning style training** — Avoids expensive full rollouts by enforcing temporal consistency between pairs of timesteps
-4. **TLS model compatibility** — The parameterization corresponds to the validated crystallographic Translation-Libration-Screw model
+---
 
-## Modified Files
+## 设计原则
+
+1. **各向同性随机桥** — B-factor 本身是各向同性量（单标量），无法区分平动/转动方向，因此采用各向同性参数化 (σ_x, σ_ω)，由模型自主分配 R³/SO(3) 柔性预算
+2. **路径积分累积** — B-factor 对应完整生成轨迹的累计不确定度，而非某一时刻的瞬时扰动
+3. **TD 风格训练** — 通过时序一致性约束训练价值函数，无需完整展开采样轨迹
+4. **简洁优先** — 相比 TLS 各向异性分解，当前设计更简洁有效，避免了过度启发式的晶体学分解
+
+---
+
+## 关键公式
+
+**瞬时柔性率（instantaneous flexibility rate）：**
+
+$$q_i(t) = \sigma_{x,i}^2(t) + \sigma_{\omega,i}^2(t)$$
+
+模型自主决定 σ_x（平动）与 σ_ω（转动）的比例，总和对应 B-factor 所表达的整体柔性。
+
+**Feynman-Kac 价值函数：**
+
+$$U_i(t) = \int_t^1 q_i(s)\, ds$$
+
+表示从时刻 t 到终点仍剩余的柔性预算。初始条件：$U_i(0) = B_i^{\text{norm}}$；终止条件：$U_i(1) = 0$。
+
+---
+
+## 修改的文件
 
 ### `rna_backbone_design/models/amplitude_net.py`
 
-**AmplitudeNet** — Output changed from `(σ_x, σ_ω)` [2 scalars/residue] to `(σ_x, s1, s2, s3)` [4 scalars/residue]:
+**AmplitudeNet** — 每个核苷酸预测两个各向同性扩散幅度：
 
-- `σ_x` [B, N]: isotropic translation amplitude (softplus, 1 param)
-- `s1, s2, s3` [B, N] each: anisotropic rotation variances along local x/y/z axes (softplus, 3 params)
-- Replaced single `head_rots` (Linear → 1) with `head_rots_aniso` (Linear → 3)
-- Extracted shared `_extract_features()` method for the backbone computation
+- 输入：`trans_t [B,N,3]`、`rotmats_t [B,N,3,3]`、`single_emb [B,N,384]`、`t [B,1]`
+- 输出：`sigma_x [B,N]`（平动幅度）、`sigma_omega [B,N]`（转动幅度），均为 softplus 正值
+- B-factor 仅作为监督目标，不作为输入
 
-**UncertaintyNet** (new class) — Predicts remaining cumulative uncertainty U_j(t):
+**UncertaintyNet** — 预测每个核苷酸的剩余累计不确定度 $U_i(t)$：
 
-- Same architecture as AmplitudeNet (FiLM + ResConvBlocks)
-- Output: `[B, N, 3]` — one value per frame atom (C4', O4', C3')
-- No positivity constraint (values decrease from B_norm at t=0 to 0 at t=1)
+- 与 AmplitudeNet 相同骨干网络（FiLM + ResConvBlock）
+- 输出：`U [B,N]`（每核苷酸 1 个标量，无正值约束）
 
-### `rna_backbone_design/data/steer_utils.py`
+**共享骨干架构：**
 
-New additions:
-- `FRAME_ATOM_LOCAL_COORDS` — Fixed tensor `[3, 3]` with C4'=(0,0,0), O4'=(1.45,0,0), C3'=(-0.38,1.48,0)
-- `get_frame_atom_local_coords(device)` — Device-aware accessor
-- `compute_frame_atom_trace_aniso(σ_x, s1, s2, s3, device)` → `[B, N, 3]`
-
-The anisotropic trace formula per frame atom j:
 ```
-q_j = 3σ_x² + (a_{j2}² + a_{j3}²)·s1 + (a_{j1}² + a_{j3}²)·s2 + (a_{j1}² + a_{j2}²)·s3
+输入特征（trans=3 + rotmat上三角=6 + single_emb=384）
+    → Linear 投影 → hidden_dim=128
+    → FiLM 时序调制（正弦嵌入 → MLP → scale/shift）
+    → 4× ResConvBlock（LayerNorm → Conv1D(k=5) → FiLM → SiLU → Conv1D）
+    → LayerNorm → Linear → 输出
 ```
 
-Sensitivity coefficients (precomputed from fixed geometry):
+### `rna_backbone_design/data/fk_utils.py`
 
-| Atom | s1 coeff (rot-x) | s2 coeff (rot-y) | s3 coeff (rot-z) |
-|------|-------------------|-------------------|-------------------|
-| C4'  | 0                 | 0                 | 0                 |
-| O4'  | 0                 | 2.10              | 2.10              |
-| C3'  | 2.19              | 0.14              | 2.33              |
+```python
+def compute_flexibility_rate(sigma_x, sigma_omega):
+    """q_i = σ_x² + σ_ω²，[B,N]"""
+    return sigma_x ** 2 + sigma_omega ** 2
 
-Key property: s1 (rotation around x-axis) **only affects C3'**, not O4' (because O4' lies on the x-axis). This breaks the isotropic degeneracy.
+def normalize_b_factors_positive(b_factors, mask, eps=1e-6):
+    """正值归一化：log → 平移至 min=0 → 缩放至 mean=1
+    必须保持正值，因为 U(t) ≥ 0 由 q ≥ 0 保证。"""
+```
 
-Existing functions (`compute_atom_trace`, `compute_local_atom_coords`, etc.) are preserved for backward compatibility.
+**注意**：z-score 归一化在此处数学上不一致——因为 $q \geq 0$ 意味着 $U$ 单调不增，所以 $U(0) \geq 0$，不能有负的目标值。
 
 ### `rna_backbone_design/models/flow_module.py`
 
-**`__init__`**: Now instantiates both `AmplitudeNet` and `UncertaintyNet` when steer is enabled.
+**`_feynman_kac_step()`** — 每步训练计算三项 FK 损失：
 
-**`_feynman_kac_step()`** (new method): Computes three Feynman-Kac losses per training step:
+| 损失项 | 公式 | 含义 |
+|--------|------|------|
+| $L_{\text{TD}}$ | $\|U(t_1) - \text{sg}[U(t_2) + \bar{q} \cdot \Delta t]\|^2$ | 时序一致性（半梯度 TD） |
+| $L_{\text{term}}$ | $\|U(x_1, t{=}1)\|^2$ | 终止条件：生成结束不确定度为零 |
+| $L_{\text{init}}$ | $\|U(x_0, t{\approx}0) - B^{\text{norm}}\|^2$ | 初始条件：起点不确定度等于归一化 B-factor |
 
-1. **L_TD (temporal consistency)**: For two timesteps t1 < t2 along the flow:
-   ```
-   L_TD = ||U(t1) - U(t2) - q̄·(t2-t1)||²
-   ```
-   where q̄ = (q(t1) + q(t2))/2 is the trapezoidal approximation. This enforces that the uncertainty consumed between t1 and t2 matches the integral of instantaneous diffusion rate.
+**时间采样策略：**
+- $t_1$ 复用 `corrupt_batch` 已采样的插值时刻（省一次前向计算）
+- $t_2$ 在 $(t_1, 1)$ 均匀采样
+- $t_2$ 时刻状态通过测地线插值从 $(x_{t_1}, R_{t_1})$ 向 $(x_1, R_1)$ 推进
 
-2. **L_term (terminal condition)**: U(x_1, t=1) = 0 — no remaining uncertainty at the end.
+**半梯度 TD（训练稳定性关键）：**
+```python
+td_target = U_t2.detach() + q_bar.detach() * dt
+L_TD = ||U_t1 - td_target||²
+```
+梯度仅通过 $U(t_1)$ 回传至 UncertaintyNet；AmplitudeNet 通过 $L_{\text{init}}$ 和 $L_{\text{term}}$ 间接受约束（若分配的总预算与 B-factor 不符，UncertaintyNet 无法同时满足所有三项条件）。
 
-3. **L_init (initial condition)**: U(x_0, t≈0) = B_norm — total accumulated uncertainty equals normalized experimental B-factor.
+**`configure_optimizers()`** — 三个参数组：
 
-Time sampling strategy:
-- t1 reuses the batch's already-sampled interpolation time (from `corrupt_batch`)
-- t2 is uniformly sampled in (t1, 1)
-- The state at t2 is obtained by further interpolating from (x_t1, R_t1) toward (x_1, R_1)
-
-**`configure_optimizers()`**: Three parameter groups — drift model (scaled LR), AmplitudeNet, UncertaintyNet.
+| 参数组 | 学习率 |
+|--------|--------|
+| 漂移模型（FlowModel） | `1e-4 × 0.1 = 1e-5` |
+| AmplitudeNet | `3e-4` |
+| UncertaintyNet | `3e-4` |
 
 ### `rna_backbone_design/data/interpolant.py`
 
-**`_rots_euler_maruyama_step()`**: Now accepts both scalar `[B, N]` and vector `[B, N, 3]` rotation amplitudes. When 3D, the noise is element-wise scaled per axis.
-
-**`sample_stochastic()`**: Updated to unpack 4 AmplitudeNet outputs and construct anisotropic noise:
-```python
-L_omega = torch.stack([s1.sqrt(), s2.sqrt(), s3.sqrt()], dim=-1)  # [B, N, 3]
-```
-
-**`rollout_terminal()`**: Same update for anisotropic noise injection.
+- `sample_stochastic` / `rollout_terminal`：解包 AmplitudeNet 的两个输出 `(sigma_x, sigma_omega)`
+- `_rots_euler_maruyama_step`：各向同性标量噪声注入：
+  ```python
+  total_rotvec = scaling * d_t * rot_vf + a_rots[..., None] * noise * d_t.sqrt()
+  ```
 
 ### `configs/config.yaml`
 
 ```yaml
-steer:
-  enabled: false
+fk_flow:
+  enabled: true
   amplitude_net:
-    c_single_in: 384
+    c_single_in: 384       # 与主模型 single_emb 维度一致
     timestep_embed_dim: 64
     hidden_dim: 128
     num_layers: 4
     kernel_size: 5
-  uncertainty_net:       # NEW
+  uncertainty_net:         # 与 amplitude_net 相同架构
     c_single_in: 384
     timestep_embed_dim: 64
     hidden_dim: 128
     num_layers: 4
     kernel_size: 5
   loss:
-    td_weight: 1.0       # L_TD weight
-    term_weight: 1.0     # L_term weight
-    init_weight: 1.0     # L_init weight
+    td_weight: 1.0         # L_TD 权重
+    term_weight: 1.0       # L_term 权重
+    init_weight: 1.0       # L_init 权重
   optimizer:
     lr: 0.0003
-  drift_lr_scale: 0.1
+  drift_lr_scale: 0.1      # 漂移模型使用缩减学习率
 ```
 
-## Data Flow Diagram
+---
+
+## 数据流
+
+### 训练阶段
 
 ```
-Training Step:
-                                    batch (x_0, x_1, B-factors)
-                                              │
-                              ┌───────────────┼───────────────┐
-                              ▼               ▼               ▼
-                       corrupt_batch    _feynman_kac_step   model_step
-                       (get x_t, t)          │              (flow losses)
-                              │        ┌─────┴──────┐
-                              ▼        ▼            ▼
-                         AmplitudeNet    UncertaintyNet
-                    (σ_x,s1,s2,s3)@t1,t2    U@t1,t2,0,1
-                              │               │
-                              ▼               ▼
-                    compute_frame_atom     L_TD + L_term + L_init
-                    _trace_aniso (q_j)
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-         L_flow          L_auxiliary       L_FK
-              └───────────────┼───────────────┘
-                              ▼
-                         total_loss
-
-Sampling:
-    x_0 ~ prior ──► Euler-Maruyama loop ──► x_1 (generated structure)
-                         │
-                    At each step k:
-                    ├─ model(x_t, t) → v_θ (drift)
-                    ├─ AmplitudeNet(x_t, t) → (σ_x, s1, s2, s3)
-                    ├─ x_{k+1} = x_k + Δt·v + √Δt·σ_x·ξ_x
-                    └─ R_{k+1} = R_k·exp(Δt·ω + √Δt·L_ω·ξ_ω)
-                         where L_ω = diag(√s1, √s2, √s3)
+batch (x_0, x_1, B-factors)
+         │
+    ┌────┴──────────────┐
+    ▼                   ▼
+corrupt_batch        _feynman_kac_step
+(得到 x_t, t)              │
+    │              ┌────┴─────────────┐
+    ▼              ▼                  ▼
+ model_step    AmplitudeNet       UncertaintyNet
+(流匹配损失)  (σ_x, σ_ω)@t1,t2    U@t1,t2,t≈0,t=1
+                   │                  │
+                   ▼                  ▼
+             q = σ_x²+σ_ω²   L_TD + L_term + L_init
+                   │                  │
+         ┌─────────┴──────────────────┘
+         ▼
+    total_loss = L_flow + L_FK
 ```
 
-## Parameter Count Estimate
+### 推断阶段
 
-| Component | Parameters | Notes |
-|-----------|-----------|-------|
-| FlowModel (drift) | ~5M | Existing, IPA-based |
-| AmplitudeNet | ~270K | 4 ResConvBlocks, hidden=128 |
-| UncertaintyNet | ~270K | Same architecture as AmplitudeNet |
-| **Total new** | **~540K** | ~10% overhead on top of drift model |
-
-## Training Overhead
-
-Each training step requires:
-- 2 AmplitudeNet forward passes (at t1 and t2)
-- 4 UncertaintyNet forward passes (at t1, t2, t=0, t=1)
-- ~2x overhead compared to vanilla flow matching (no full rollouts needed)
-
-This is significantly cheaper than the previous L_cov loss which required M full trajectory rollouts.
-
-## Key Design Decisions
-
-1. **Frame atoms only**: B-factor supervision targets only C4', O4', C3' (the 3 frame-defining atoms), not all 23 atoms. This is because the SE(3) frame only controls these atoms directly; sidechain atoms depend on torsion angles.
-
-2. **Reuse batch interpolation**: t1 reuses the already-computed noisy state from `corrupt_batch()` rather than generating a fresh interpolation, saving one model forward pass.
-
-3. **No rollouts for training**: The TD-style loss eliminates the need for trajectory rollouts during training. The value function U_φ learns to predict the integral, while AmplitudeNet learns to distribute the budget.
-
-4. **Backward compatible**: The anisotropic `_rots_euler_maruyama_step` auto-detects scalar vs vector input, so existing isotropic code paths still work.
-
-## Critical Design Constraints
-
-### Positivity of B-factor targets
-
-Since q_j = 3σ_x² + ... ≥ 0, the ODE dU/dt = -q implies U is monotonically non-increasing. Combined with U(1) = 0, this forces U(0) ≥ 0 for all atoms. Therefore, B-factor normalization **must preserve positivity** — z-score normalization (mean=0, negative values) is mathematically inconsistent. We use `normalize_b_factors_positive()` which applies log-shift-scale to keep all targets ≥ 0.
-
-### Semi-gradient TD update
-
-The TD loss detaches both U(t2) and q̄ from the gradient graph:
 ```
-td_target = U(t2).detach() + q̄.detach() · Δt
-L_TD = ||U(t1) - td_target||²
+x_0 ~ 先验（中心高斯平动 + 均匀 SO(3) 转动）
+    │
+    └─► Euler-Maruyama 循环（60步）
+              │
+         每步 k：
+         ├─ FlowModel(x_t, t) → v_θ（漂移）
+         ├─ AmplitudeNet(x_t, t) → (σ_x, σ_ω)
+         ├─ x_{k+1} = x_k + Δt·v_θ + √Δt·σ_x·ξ_x
+         └─ R_{k+1} = R_k · exp(Δt·ω + √Δt·σ_ω·ξ_ω)
+              │
+         x_1（生成结构）
 ```
-This ensures L_TD trains UncertaintyNet via U(t1) only (standard semi-gradient TD). AmplitudeNet receives gradients only through the non-detached q terms in q̄ via a separate path — it is **not** trained by L_TD in the current formulation. AmplitudeNet's noise schedule is indirectly constrained: if it assigns too much/too little budget, UncertaintyNet cannot simultaneously satisfy L_init (U(0)=B) and L_term (U(1)=0) while being consistent with L_TD.
 
-### Prior state for L_init
+---
 
-The initial condition loss evaluates U at t≈0 where the state is pure noise. The prior is sampled correctly: centered Gaussian translations (scale = NM_TO_ANG_SCALE = 10Å) and uniform SO(3) rotations, matching the actual prior used in `corrupt_batch` and `sample`.
+## 参数量估算
+
+| 模块 | 参数量 | 备注 |
+|------|--------|------|
+| FlowModel（漂移） | ~5M | 现有 IPA 架构 |
+| AmplitudeNet | ~270K | 4层 ResConvBlock，hidden=128 |
+| UncertaintyNet | ~270K | 与 AmplitudeNet 相同结构 |
+| **新增合计** | **~540K** | 约为漂移模型的 10% |
+
+---
+
+## 训练开销
+
+每步训练需要：
+- 2次 AmplitudeNet 前向（t1 和 t2 时刻）
+- 4次 UncertaintyNet 前向（t1、t2、t≈0、t=1）
+- 与之前 L_cov（需要 M 条完整轨迹）相比，开销大幅降低（约 2× 基础流匹配开销）
+
+---
+
+## 关键设计决策
+
+**1. 各向同性而非 TLS 各向异性分解**
+
+B-factor 是各向同性量（3 个帧原子，4 个 TLS 未知量，欠定）。非刚体运动（扭转角、晶体堆积）也会污染 B-factor 信号，使方向信息不可靠。因此放弃 TLS 分解，改为由模型自主学习 R³/SO(3) 柔性分配，保持设计简洁。
+
+**2. 以 L_init 为主要监督入口**
+
+AmplitudeNet 本身不直接接受 B-factor 监督。其柔性分配的合理性来自约束：UncertaintyNet 必须同时满足 $U(0)=B$、$U(1)=0$ 和时序一致性。若 AmplitudeNet 给出的 q 总量与 B-factor 不一致，UncertaintyNet 的三项条件无法同时成立。
+
+**3. L_init 的先验采样**
+
+初始条件在 $t \approx 0$ 处评估，状态为纯噪声：中心化高斯平动（尺度 10Å）+ 均匀 SO(3) 转动，与 `corrupt_batch` 使用的先验完全一致。
+
+**4. 复用插值时刻**
+
+$t_1$ 直接复用 `corrupt_batch` 计算的 $x_{t_1}$，避免额外的插值开销。
+
+**5. B-factor 正值归一化的必要性**
+
+由 $q \geq 0$ 可知 $U(t)$ 单调不增。结合 $U(1)=0$，必须保证 $U(0) \geq 0$，即 B-factor 目标值必须非负。z-score 归一化（均值为 0，存在负值）在此框架下数学上不一致，必须使用正值保持的归一化方法（log → 平移 → 缩放）。

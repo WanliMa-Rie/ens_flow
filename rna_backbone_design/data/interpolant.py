@@ -192,11 +192,7 @@ class Interpolant:
     def _rots_euler_maruyama_step(self, d_t, t, rotmats_1, rotmats_t, a_rots):
         """Euler-Maruyama step on SO(3): geodesic drift + tangent-space noise.
 
-        Implements: R_{k+1} = R_k exp(Δt·ω_θ + √Δt · a_{R,ψ} · ζ_k)
-
-        a_rots can be:
-          - [B, N] scalar: isotropic rotation noise (legacy)
-          - [B, N, 3] vector: anisotropic rotation noise per axis
+        Implements: R_{k+1} = R_k exp(Δt·ω_θ + √Δt · σ_ω · ζ_k)
         """
         if self._rots_cfg.sample_schedule == "linear":
             scaling = 1 / (1 - t)
@@ -206,12 +202,7 @@ class Interpolant:
             raise ValueError(f"Unknown sample schedule {self._rots_cfg.sample_schedule}")
         rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
         noise = torch.randn_like(rot_vf)
-        if a_rots.dim() == rot_vf.dim():
-            # Anisotropic: a_rots is [B, N, 3], element-wise multiply
-            total_rotvec = scaling * d_t * rot_vf + a_rots * noise * d_t.sqrt()
-        else:
-            # Isotropic: a_rots is [B, N], broadcast over 3
-            total_rotvec = scaling * d_t * rot_vf + a_rots[..., None] * noise * d_t.sqrt()
+        total_rotvec = scaling * d_t * rot_vf + a_rots[..., None] * noise * d_t.sqrt()
         delta_rot = so3_utils.rotvec_to_rotmat(total_rotvec)
         return torch.einsum("...ij,...jk->...ik", rotmats_t, delta_rot)
 
@@ -354,7 +345,7 @@ class Interpolant:
 
             with torch.no_grad():
                 model_out = model(batch)
-                sigma_x, s1, s2, s3 = amplitude_net(
+                sigma_x, sigma_omega = amplitude_net(
                     trans_t_1, rotmats_t_1, single_emb, t
                 )
 
@@ -366,14 +357,11 @@ class Interpolant:
 
             d_t = t_2 - t_1
 
-            # Anisotropic rotation noise: L_ω = diag(√s1, √s2, √s3)
-            L_omega = torch.stack([s1.sqrt(), s2.sqrt(), s3.sqrt()], dim=-1)  # [B, N, 3]
-
             trans_t_2 = self._trans_euler_maruyama_step(
                 d_t, t_1, pred_trans_1, trans_t_1, sigma_x
             )
             rotmats_t_2 = self._rots_euler_maruyama_step(
-                d_t, t_1, pred_rotmats_1, rotmats_t_1, L_omega
+                d_t, t_1, pred_rotmats_1, rotmats_t_1, sigma_omega
             )
             prot_traj.append((trans_t_2, rotmats_t_2))
             t_1 = t_2
@@ -445,8 +433,7 @@ class Interpolant:
 
             with torch.no_grad():
                 model_out = model(batch)
-            # Amplitude net WITH gradients for L_cov backprop
-            sigma_x, s1, s2, s3 = amplitude_net(trans_t, rotmats_t, single_emb, t)
+            sigma_x, sigma_omega = amplitude_net(trans_t, rotmats_t, single_emb, t)
 
             pred_trans_1 = model_out["pred_trans"]
             pred_rotmats_1 = model_out["pred_rotmats"]
@@ -454,12 +441,11 @@ class Interpolant:
                 batch["trans_sc"] = pred_trans_1
 
             d_t = t_2 - t_1
-            L_omega = torch.stack([s1.sqrt(), s2.sqrt(), s3.sqrt()], dim=-1)  # [B, N, 3]
             trans_t = self._trans_euler_maruyama_step(
                 d_t, t_1, pred_trans_1, trans_t, sigma_x
             )
             rotmats_t = self._rots_euler_maruyama_step(
-                d_t, t_1, pred_rotmats_1, rotmats_t, L_omega
+                d_t, t_1, pred_rotmats_1, rotmats_t, sigma_omega
             )
             t_1 = t_2
 

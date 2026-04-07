@@ -61,7 +61,7 @@ experiment:
   validation:
     num_generated: 50
   wandb:
-    name: baseline
+    name: td-flow
     project: ens_flow
     save_code: false
     tags: []
