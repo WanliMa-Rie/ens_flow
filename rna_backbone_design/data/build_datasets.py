@@ -36,19 +36,19 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="./data",
+        default="/projects/u6bk/wanli/ensemble_dataset",
         help="Root directory containing cluster folders.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./data/preprocessed_data",
+        default="/projects/u6bk/wanli/ensemble_dataset/preprocessed_data",
         help="Directory to save the processed .pt files.",
     )
     parser.add_argument(
         "--cluster_split",
         type=str,
-        default="./data/cdhit_80_split_indices.json",
+        default="/projects/u6bk/wanli/ensemble_dataset/split_cdhit80.json",
         help="Path to split_cdhit80.json. Defaults to <data_dir>/split_cdhit80.json.",
     )
     parser.add_argument("--split_cache_filename", type=str, default="split_cdhit80.json")
@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument(
         "--full_sequence_fasta",
         type=str,
-        required=True,
+        default="/projects/u6bk/wanli/ensemble_dataset/all_sequences.fasta",
         help="Path to FASTA file with full sequences. Record IDs must equal cluster_name.",
     )
     parser.add_argument(
@@ -119,8 +119,9 @@ def align_structure_to_full_sequence(
     model = list(structure.get_models())[0]
     chain = list(model.get_chains())[0]
 
-    # Encode full sequence aatype from FASTA (unknown letters → 0)
-    aatype = np.zeros(seq_len, dtype=np.int64)
+    # Encode full sequence aatype from FASTA (unknown letters → 'x' = 26)
+    unk_idx = vocabulary.restype_order['x']
+    aatype = np.full(seq_len, unk_idx, dtype=np.int64)
     for i, letter in enumerate(full_sequence):
         vocab_letter = letter.lower()
         if vocab_letter in vocabulary.restype_order:
@@ -141,7 +142,9 @@ def align_structure_to_full_sequence(
         idx = label_seq_id - 1    # 0-based position in full sequence
         occupied.add(idx)
 
-        # Fill atom coordinates
+        # Fill atom coordinates (skip non-standard residues)
+        if resname not in nc.restype_name_to_compact_atom_order:
+            continue
         compact_atom_order = nc.restype_name_to_compact_atom_order[resname]
         pos = np.zeros((num_atoms, 3), dtype=np.float64)
         mask = np.zeros(num_atoms, dtype=np.float64)
@@ -238,8 +241,12 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     torsion_angles_sin_cos = na_feats["torsion_angles_sin_cos"][:, :8].float()
     torsion_angles_mask = na_feats["torsion_angles_mask"][:, :8].float()
 
-    # Per-residue B-factor from C4' atom
+    # Per-residue B-factor from C4' atom (backward compat)
     b_factors = atom_b_factors[:, c4_idx]
+
+    # Atom-wise B-factors and mask in compact 23-atom format
+    atom_b_factors_compact = atom_b_factors[:, :num_na_atoms].float()
+    atom_mask_compact = atom_mask[:, :num_na_atoms].float()
 
     # Normalize unsolved positions: zero geometry, identity rotation
     unsolved = (res_mask == 0)
@@ -250,6 +257,8 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     torsion_angles_sin_cos[unsolved] = 0.0
     torsion_angles_mask[unsolved] = 0.0
     b_factors[unsolved] = 0.0
+    atom_b_factors_compact[unsolved] = 0.0
+    atom_mask_compact[unsolved] = 0.0
 
     return {
         "aatype": aatype,
@@ -262,6 +271,8 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
         "c4_coords": c4_coords,
         "bb_coords": bb_coords,
         "b_factors": b_factors,
+        "atom_b_factors": atom_b_factors_compact,
+        "atom_mask_compact": atom_mask_compact,
     }
 
 
@@ -305,6 +316,8 @@ def process_conformers(
                 "c4_coords": geom["c4_coords"],
                 "bb_coords": geom["bb_coords"],
                 "b_factors": geom["b_factors"],
+                "atom_b_factors": geom["atom_b_factors"],
+                "atom_mask_compact": geom["atom_mask_compact"],
             }
         )
 

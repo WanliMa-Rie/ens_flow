@@ -2,6 +2,7 @@ import torch, copy
 from rna_backbone_design.data import so3_utils
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.data import all_atom as rna_all_atom
+from rna_backbone_design.models.bridge_width_net import base_schedule, compute_geometric_residuals
 
 from scipy.spatial.transform import Rotation
 from scipy.optimize import linear_sum_assignment
@@ -36,7 +37,6 @@ class Interpolant:
     def __init__(self, cfg):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
-        self._trans_cfg = cfg.trans
         self._sample_cfg = cfg.sampling
         self._igso3 = None
 
@@ -88,10 +88,12 @@ class Interpolant:
         aligned_nm_1 = aligned_nm_1.reshape(num_batch, num_batch, num_res, 3)
 
         # Compute cost matrix of aligned noise to ground truth
+        # Only sum over resolved (res_mask=1) positions to avoid padding contamination
         batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)
-        cost_matrix = torch.sum(
-            torch.linalg.norm(aligned_nm_0 - aligned_nm_1, dim=-1), dim=-1
-        ) / torch.sum(batch_mask, dim=-1)
+        norms = torch.linalg.norm(aligned_nm_0 - aligned_nm_1, dim=-1)
+        masked_cost = (norms * batch_mask).sum(dim=-1)
+        denom = batch_mask.sum(dim=-1).clamp(min=1)  # avoid div-by-zero for empty masks
+        cost_matrix = masked_cost / denom
         noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
         return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))]
 
@@ -121,7 +123,10 @@ class Interpolant:
             batch (dict) : a dictionary where each key is a tensor name and each value is the corresponding tensor of Rigid objects (representing the RNA frames).
 
         Remarks:
-            This method takes in a clean ground truth batch (x_1) and adds returns the interpolated (noised) batch (x_t).
+            This method takes in a clean ground truth batch (x_1) and returns the
+            deterministically interpolated (noised) batch (x_t). The stochastic bridge
+            width sigma only participates in the heteroscedastic NLL loss (Level 2/3)
+            and in inference via Euler-Maruyama; it does NOT enter corruption.
 
         Returns:
             batch of corrupted/noisy/interpolated tensors
@@ -132,7 +137,7 @@ class Interpolant:
         trans_1 = batch["trans_1"]  # # [B, N, 3] (in Angstrom)
         rotmats_1 = batch["rotmats_1"]  # [B, N, 3, 3]
         res_mask = batch["res_mask"]  # [B, N]
-        num_batch, _ = res_mask.shape
+        num_batch = res_mask.shape[0]
 
         # get random timestep in [0, 1] for flow matching
         t = self.sample_t(num_batch)[:, None]  # [B, 1]
@@ -140,10 +145,11 @@ class Interpolant:
 
         # apply corruptions to translations
         trans_t = self._corrupt_trans(trans_1, t, res_mask)
-        noisy_batch["trans_t"] = trans_t
 
         # apply corruptions to rotations
         rotmats_t = self._corrupt_rotmats(rotmats_1, t, res_mask)
+
+        noisy_batch["trans_t"] = trans_t
         noisy_batch["rotmats_t"] = rotmats_t
 
         return noisy_batch
@@ -191,8 +197,7 @@ class Interpolant:
     def _rots_euler_maruyama_step(self, d_t, t, rotmats_1, rotmats_t, a_rots):
         """Euler-Maruyama step on SO(3): geodesic drift + tangent-space noise.
 
-        Implements: R_{k+1} = R_k exp(Δt·ω_θ + √Δt · a_{R,ψ} · ζ_k)
-        (Section 5, with U_{R,θ}=I)
+        Implements: R_{k+1} = R_k exp(Δt·ω_θ + √Δt · σ_ω · ζ_k)
         """
         if self._rots_cfg.sample_schedule == "linear":
             scaling = 1 / (1 - t)
@@ -302,24 +307,24 @@ class Interpolant:
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
 
-    def sample_stochastic(self, num_batch, num_res, model, amplitude_net, b_norm, context=None):
-        """Stochastic sampling via Euler-Maruyama integration (Section 5).
+    def sample_stochastic(self, num_batch, num_res, model, bridge_width_net,
+                          context=None, bridge_cfg=None):
+        """Stochastic sampling via Euler-Maruyama on SE(3) with heteroscedastic bridge.
 
-        Uses separate translation and rotation amplitudes a_{x,ψ} and a_{R,ψ}.
-        Accumulates quadratic variation Q_i on the translation channel
-        (Section 7): Q_i = ∫ Tr(D_{x,i}) dt ≈ 3 · Σ_k a_{x,ψ}^2 · Δt.
+        At each step, the drift model provides a reference prediction from which
+        geometric residuals are computed. BridgeWidthNet then predicts per-residue
+        modulation factors alpha, yielding effective bridge width beta = sigma_0(t) * alpha.
 
         Args:
             num_batch: number of independent samples.
             num_res: number of residues.
             model: drift field network.
-            amplitude_net: AmplitudeNet returning (a_trans, a_rots).
-            b_norm: [num_batch, num_res] normalized B-factor profile.
+            bridge_width_net: BridgeWidthNet predicting (alpha_x, alpha_omega).
             context: conditioning dict (single_embedding, pair_embedding).
+            bridge_cfg: stochastic bridge config with base_schedule params.
 
         Returns:
-            (atom37_traj, clean_atom37_traj, clean_traj, qv)
-            qv: [num_batch, num_res] accumulated quadratic variation (trans channel).
+            (atom37_traj, clean_atom37_traj, clean_traj)
         """
         res_mask = torch.ones(num_batch, num_res, device=self._device)
         trans_0 = _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
@@ -333,9 +338,11 @@ class Interpolant:
         ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
         t_1 = ts[0]
 
-        qv = torch.zeros(num_batch, num_res, device=self._device)
         prot_traj = [(trans_0, rotmats_0)]
         clean_traj = []
+
+        single_emb = context["single_embedding"] if context is not None else None
+        pair_emb = context["pair_embedding"] if context is not None else None
 
         for t_2 in ts[1:]:
             trans_t_1, rotmats_t_1 = prot_traj[-1]
@@ -346,20 +353,37 @@ class Interpolant:
 
             with torch.no_grad():
                 model_out = model(batch)
-                a_trans, a_rots = amplitude_net(b_norm, t)
+                pred_trans_1 = model_out["pred_trans"]
+                pred_rotmats_1 = model_out["pred_rotmats"]
 
-            pred_trans_1 = model_out["pred_trans"]
-            pred_rotmats_1 = model_out["pred_rotmats"]
+                # Geometric residuals and bridge width
+                delta_x, delta_omega = compute_geometric_residuals(
+                    trans_t_1, rotmats_t_1, pred_trans_1, pred_rotmats_1
+                )
+                alpha_x, alpha_omega = bridge_width_net(
+                    single_emb, delta_x, delta_omega, pair_emb, t
+                )
+
+                # Effective bridge width: beta = sigma_0(t) * alpha
+                t_scalar = t_1.item()
+                t_for_schedule = torch.tensor([[t_scalar]], device=self._device)
+                sigma_0_x = base_schedule(t_for_schedule, bridge_cfg.base_schedule.lambda_x)
+                sigma_0_w = base_schedule(t_for_schedule, bridge_cfg.base_schedule.lambda_omega)
+                beta_x = sigma_0_x.squeeze() * alpha_x
+                beta_omega = sigma_0_w.squeeze() * alpha_omega
+
             clean_traj.append((pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu()))
             if self._cfg.self_condition:
                 batch["trans_sc"] = pred_trans_1
 
             d_t = t_2 - t_1
-            # QV on translation channel: Tr(D_{x,i}) = 3 · a_{x,ψ}²  (U=I, R³)
-            qv += a_trans ** 2 * d_t
 
-            trans_t_2 = self._trans_euler_maruyama_step(d_t, t_1, pred_trans_1, trans_t_1, a_trans)
-            rotmats_t_2 = self._rots_euler_maruyama_step(d_t, t_1, pred_rotmats_1, rotmats_t_1, a_rots)
+            trans_t_2 = self._trans_euler_maruyama_step(
+                d_t, t_1, pred_trans_1, trans_t_1, beta_x
+            )
+            rotmats_t_2 = self._rots_euler_maruyama_step(
+                d_t, t_1, pred_rotmats_1, rotmats_t_1, beta_omega
+            )
             prot_traj.append((trans_t_2, rotmats_t_2))
             t_1 = t_2
 
@@ -387,4 +411,5 @@ class Interpolant:
             prot_traj, is_na_residue_mask, pred_torsions_1
         )
 
-        return atom37_traj_rna, clean_atom37_traj_rna, clean_traj, qv
+        return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
+

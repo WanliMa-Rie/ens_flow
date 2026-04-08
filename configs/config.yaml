@@ -1,26 +1,20 @@
 data_cfg:
-  data_dir: /projects/u6bk/wanli/rna_ensemble_data # Path to ensemble data root
+  data_dir: /projects/u6bk/wanli/ensemble_dataset # Path to ensemble data root
   preprocessed_dir: ${data_cfg.data_dir}/preprocessed_data
-  batch_size: 16  # 28
-  max_batch_size: 12
+  batch_size: 10  # 28
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   drop_last: false
-  posterior_nearest_p: 0
-  embedding_cache_size: 4
   val_ensemble_as_cluster: true
   test_ensemble_as_cluster: true
+  max_seq_len: 300
 
 interpolant:
   min_t: 1e-2
   rots:
-    train_schedule: linear
     sample_schedule: exp
     exp_rate: 10
-  trans:
-    train_schedule: linear
-    sample_schedule: linear
   sampling:
     num_timesteps: 60
   self_condition: ${model.edge_features.self_condition}
@@ -28,23 +22,15 @@ interpolant:
 model:
   node_embed_size: 256
   edge_embed_size: 128
-  symmetric: False
   node_features:
     c_s: ${model.node_embed_size}
     c_pos_emb: 128
     c_timestep_emb: 128
     c_single_in: 384
-    embed_diffuse_mask: False
-    max_num_res: 2000
-    timestep_int: 1000
   edge_features:
-    single_bias_transition_n: 2
     c_s: ${model.node_embed_size}
     c_p: ${model.edge_embed_size}
     c_pair_in: 128
-    relpos_k: 64
-    use_rbf: True
-    num_rbf: 32
     feat_dim: 64
     num_bins: 22
     self_condition: True
@@ -57,17 +43,10 @@ model:
     no_v_points: 12
     seq_tfmr_num_heads: 4
     seq_tfmr_num_layers: 2
-    num_blocks: 4   # 6
+    num_blocks: 5   # 6
 
 experiment:
   seed: 123
-  num_devices: 4
-  use_swa: False
-  batch_ot:
-    enabled: True
-    cost: kabsch
-    noise_per_sample: 1
-    permute: False
   training:
     loss: se3_vf_loss
     bb_atom_scale: 0.1
@@ -80,13 +59,10 @@ experiment:
     tors_loss_scale: 1.0
     num_non_frame_atoms: 0 # choose from [0, 3, 7]
   validation:
-    num_generated: 150
-    ensemble:
-      max_batches: 5
-      num_gt: 20
+    num_generated: 50
   wandb:
-    name: baseline
-    project: velmix
+    name: 2_test
+    project: ens_flow
     save_code: false
     tags: []
     mode: "online" # can also save to `offline`
@@ -101,28 +77,35 @@ experiment:
     accelerator: gpu
     log_every_n_steps: 1
     deterministic: False
-    strategy: ddp
+    strategy: ddp_find_unused_parameters_true
     check_val_every_n_epoch: 10
+    num_sanity_val_steps: 0
     accumulate_grad_batches: 1
   checkpointer:
     dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
-    save_last: True
-    save_top_k: 3
-    monitor: train/loss
-    mode: min
-    every_n_epochs: 20
 
-steer:
-  enabled: false
-  amplitude_net:
+stochastic_bridge:
+  level: 2                    # 1=deterministic flow, 2=heteroscedastic bridge, 3=bridge+B-factor
+  bridge_width_net:
+    c_single_in: ${model.node_features.c_single_in}  # 384
+    c_pair_in: ${model.edge_features.c_pair_in}      # 128
     timestep_embed_dim: 64
     hidden_dim: 128
     num_layers: 4
     kernel_size: 5
-  loss:
-    qv_weight: 1.0
-    cov_weight: 0.0
-    cov_num_rollouts: 4
+    alpha_min: 0.1
+    alpha_max: 3.0
+  base_schedule:
+    # lambda_x is in raw Angstroms (Option B: NLL stays in physical units).
+    # Target: sigma_x^0(t=0.5) = lambda_x/2 ≈ typical r_x magnitude, so that
+    # alpha_x^* = r_x / sigma_x^0 lands near 1.0 (center of [0.1, 3.0]).
+    # For RNA backbones the typical mid-training drift residual r_x is ~2 Å,
+    # giving lambda_x ≈ 4.0. Calibrate via the train/bridge_r_x_mean log.
+    lambda_x: 4.0
+    lambda_omega: 0.5           # Rotation already in rad, typical r_w ~ 0.25 rad at t=0.5
+  width_loss_weight: 1.0        # Global scale on top of the per-modality weighted NLL
+  bfactor_supervision:
+    weight: 1.0
   optimizer:
     lr: 0.0003
   drift_lr_scale: 0.1
