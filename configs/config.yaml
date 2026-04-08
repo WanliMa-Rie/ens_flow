@@ -61,7 +61,7 @@ experiment:
   validation:
     num_generated: 50
   wandb:
-    name: 2_test
+    name: 3_test
     project: ens_flow
     save_code: false
     tags: []
@@ -85,27 +85,31 @@ experiment:
     dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
 
 stochastic_bridge:
-  level: 2                    # 1=deterministic flow, 2=heteroscedastic bridge, 3=bridge+B-factor
-  bridge_width_net:
-    c_single_in: ${model.node_features.c_single_in}  # 384
-    c_pair_in: ${model.edge_features.c_pair_in}      # 128
-    timestep_embed_dim: 64
-    hidden_dim: 128
-    num_layers: 4
-    kernel_size: 5
-    alpha_min: 0.1
-    alpha_max: 3.0
-  base_schedule:
-    # lambda_x is in raw Angstroms (Option B: NLL stays in physical units).
-    # Target: sigma_x^0(t=0.5) = lambda_x/2 ≈ typical r_x magnitude, so that
-    # alpha_x^* = r_x / sigma_x^0 lands near 1.0 (center of [0.1, 3.0]).
-    # For RNA backbones the typical mid-training drift residual r_x is ~2 Å,
-    # giving lambda_x ≈ 4.0. Calibrate via the train/bridge_r_x_mean log.
-    lambda_x: 4.0
-    lambda_omega: 0.5           # Rotation already in rad, typical r_w ~ 0.25 rad at t=0.5
-  width_loss_weight: 1.0        # Global scale on top of the per-modality weighted NLL
-  bfactor_supervision:
-    weight: 1.0
-  optimizer:
-    lr: 0.0003
-  drift_lr_scale: 0.1
+  level: 2                    # 1=deterministic flow, 2=SE(3) stochastic bridge, 3=bridge + B-factor
+  bridge:
+    # Fixed, global bridge widths in raw physical units.
+    # Chosen so that the BB std at t=0.5 (= sigma/2) matches the typical Level 1
+    # drift residual: r_x ~ 2 Å → sigma_x ≈ 2 Å, r_omega ~ 0.25 rad → sigma_omega ≈ 0.25 rad.
+    sigma_x: 2.0              # Å — translation bridge width
+    sigma_omega: 0.25         # rad — rotation bridge width
+
+  # --- Level 3 only -------------------------------------------------------
+  # Sequence-only FlexibilityNet head + per-residue flexibility multiplier.
+  # Reduces to Level 2 exactly when nu_i ≡ 1 (zero-init of the last Linear
+  # weight + bias = log(e-1) guarantees this at step 0).
+  flexibility:
+    hidden_dim: 128           # flex head hidden width
+    eps: 1.0e-4               # numerical floor added after softplus
+  # B-factor supervision (Level 3 only).
+  #   L_B  = mean( (log nu_i - log b_i)^2 ) on valid residues
+  #   L_nu = mean( (log nu_i)^2 )            (log-space regularizer)
+  bfactor:
+    enabled: true             # set to false to disable B-factor supervision
+    lambda_b: 1.0             # weight on L_B
+    lambda_nu: 0.01           # weight on L_nu
+    min_valid_bfactor: 0.0    # residues with b_factor <= this are dropped from L_B
+  # Training phase (Level 3 only):
+  #   - full:         joint training of FlowModel + FlexibilityNet (default)
+  #   - psi_only:     freeze FlowModel, train only FlexibilityNet on L_B + L_nu
+  #                   (optional warm-start stage after Level 2 pretrain)
+  training_phase: full
