@@ -120,6 +120,9 @@ exclude_lines = [
 [tool.uv]
 # Removed x86-only find-links for torch-geometric as GH200 is ARM64
 no-build-package = ["torchvision", "torchaudio"]
+# Lock only for the platforms we actually train on (Modal = linux x86_64 CUDA).
+# This avoids resolution failures on macOS where cu126 torch wheels don't exist.
+environments = ["platform_system == 'Linux' and platform_machine == 'x86_64'"]
 
 [tool.uv.extra-build-dependencies]
 # `flash-attn` imports `torch` during wheel build; ensure build isolation has it.

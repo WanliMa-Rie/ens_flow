@@ -1,0 +1,204 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{serganov2013decade}
+\citation{mustoe2014hierarchy}
+\citation{alphafold3}
+\citation{framediff}
+\citation{frameflow}
+\citation{foldflow}
+\citation{rnaframeflow}
+\citation{dig}
+\citation{bioemu}
+\citation{alphaflow}
+\citation{str2str}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{RNAs are not rigid.}{1}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What existing $\mathrm  {SE}(3)$ generative models miss.}{1}{section*.2}\protected@file@percent }
+\citation{framediff}
+\citation{frameflow}
+\citation{rnaframeflow}
+\citation{foldflow}
+\citation{alphaflow}
+\citation{dig}
+\citation{bioemu}
+\citation{str2str}
+\citation{improveddpm}
+\citation{framediff}
+\citation{frameflow}
+\citation{chroma}
+\citation{genie}
+\citation{rfdiffusion}
+\citation{rnaframeflow}
+\citation{foldflow}
+\citation{stochasticinterpolants}
+\citation{shi2023dsbm}
+\@writefile{toc}{\contentsline {paragraph}{The key insight.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Contributions.}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Related Work}{2}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{2}{2}{Related Work}{section.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{$\mathrm  {SE}(3)$ flow/diffusion for biomolecules.}{2}{section*.5}\protected@file@percent }
+\citation{dig}
+\citation{bioemu}
+\citation{alphaflow}
+\citation{str2str}
+\citation{improveddpm}
+\citation{vdm}
+\citation{rnaframeflow}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Positioning of \textsc  {EnsFlow} against representative prior work on $\mathrm  {SE}(3)$ generative modeling and ensemble generation. ``SDE'' = stochastic dynamics; ``Learned $\sigma $'' = noise coefficient learned jointly with drift; ``State-dep.'' = noise depends on current noisy state; ``Residue-wise'' = noise varies per residue; ``Physical anchor'' = learned uncertainty explicitly tied to experimentally measured flexibility. \textsc  {EnsFlow} is the first to check all boxes.}}{3}{table.1}\protected@file@percent }
+\newlabel{tab:related}{{1}{3}{Positioning of \textsc {EnsFlow} against representative prior work on $\SE (3)$ generative modeling and ensemble generation. ``SDE'' = stochastic dynamics; ``Learned $\sigma $'' = noise coefficient learned jointly with drift; ``State-dep.'' = noise depends on current noisy state; ``Residue-wise'' = noise varies per residue; ``Physical anchor'' = learned uncertainty explicitly tied to experimentally measured flexibility. \textsc {EnsFlow} is the first to check all boxes}{table.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stochastic bridges and interpolants.}{3}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Ensemble generation for biomolecules.}{3}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Learned variance in generative modeling.}{3}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Preliminaries}{3}{section.3}\protected@file@percent }
+\newlabel{sec:prelim}{{3}{3}{Preliminaries}{section.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Nucleotide frames.}{3}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Time convention.}{3}{section*.10}\protected@file@percent }
+\newlabel{eq:velocity}{{1}{3}{Time convention}{equation.1}{}}
+\citation{nikolayev1997igso3,leach2022denoisingso3}
+\@writefile{toc}{\contentsline {paragraph}{$\mathrm  {SE}(3)$ flow matching.}{4}{section*.11}\protected@file@percent }
+\newlabel{eq:flow-loss}{{2}{4}{$\SE (3)$ flow matching}{equation.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{$\mathrm  {SO}(3)$ Brownian bridges via tangent-space Gaussians.}{4}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Method}{4}{section.4}\protected@file@percent }
+\newlabel{sec:method}{{4}{4}{Method}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Problem formulation}{4}{subsection.4.1}\protected@file@percent }
+\newlabel{subsec:problem}{{4.1}{4}{Problem formulation}{subsection.4.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Level 2: Conditional heteroscedastic $\mathrm  {SE}(3)$ stochastic bridge}{4}{subsection.4.2}\protected@file@percent }
+\newlabel{subsec:bridge}{{4.2}{4}{Level 2: Conditional heteroscedastic $\SE (3)$ stochastic bridge}{subsection.4.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{The SDE.}{4}{section*.13}\protected@file@percent }
+\newlabel{eq:sde-trans}{{3}{4}{The SDE}{equation.3}{}}
+\newlabel{eq:sde-rots}{{4}{4}{The SDE}{equation.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Endpoint-safe base schedule and bounded modulation.}{4}{section*.14}\protected@file@percent }
+\newlabel{eq:sigma-decomp}{{5}{4}{Endpoint-safe base schedule and bounded modulation}{equation.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {\textsc  {EnsFlow} architecture and training data flow.} Two networks share the sequence/state input. The \textbf  {FlowModel} drift (top blue, 14.2M) is the standard $\mathrm  {SE}(3)$ flow-matching backbone: it predicts the clean endpoint $\hat  G_{1|t}$ and the induced velocity $u_\theta $, supervised by the flow-matching loss $\mathcal  {L}_{\mathrm  {flow}}$. From the drift's own prediction and the noisy state we compute per-residue geometric residuals $\Delta ^x = x_t-\hat  x_{1|t}$ and $\Delta ^\omega = \mathrm  {Log}(\hat  R_{1|t}^{\!\top }R_t)$. The \textbf  {BridgeWidthNet} (bottom blue, 0.9M) consumes these residuals together with the drift's single/pair embeddings (carried inside the drift arrow) and the timestep $t$, and outputs bounded per-residue modulation factors $\alpha ^x,\alpha ^\omega \in [\alpha _{\min },\alpha _{\max }]$. Multiplied by the endpoint-vanishing base schedule $\sigma _0(t)=\lambda \sqrt  {t(1-t)}$ they yield the effective bridge width $\sigma $. Level~2 trains $\sigma $ via the heteroscedastic NLL loss $\mathcal  {L}_{\mathrm  {width}}$, whose pointwise minimum is $\sigma ^{\ast }=\|r\|$ (Prop.~\ref {prop:self-reg}). Level~3 further anchors $\alpha $ to normalized experimental B-factors $\tilde  B_i$ via $\mathcal  {L}_{\mathrm  {bfactor}}$. At inference (dashed path), the same $\sigma $ drives the Euler--Maruyama noise term $\sqrt  {\Delta t}\,\sigma \,\xi $. All residuals and embeddings feeding BridgeWidthNet are \emph  {detached} from the drift computation graph, so bridge-width gradients do not flow back into the drift network.}}{5}{figure.1}\protected@file@percent }
+\newlabel{fig:architecture}{{1}{5}{\textbf {\textsc {EnsFlow} architecture and training data flow.} Two networks share the sequence/state input. The \textbf {FlowModel} drift (top blue, 14.2M) is the standard $\SE (3)$ flow-matching backbone: it predicts the clean endpoint $\hat G_{1|t}$ and the induced velocity $u_\theta $, supervised by the flow-matching loss $\mathcal {L}_{\mathrm {flow}}$. From the drift's own prediction and the noisy state we compute per-residue geometric residuals $\Delta ^x = x_t-\hat x_{1|t}$ and $\Delta ^\omega = \Log (\hat R_{1|t}^{\!\top }R_t)$. The \textbf {BridgeWidthNet} (bottom blue, 0.9M) consumes these residuals together with the drift's single/pair embeddings (carried inside the drift arrow) and the timestep $t$, and outputs bounded per-residue modulation factors $\alpha ^x,\alpha ^\omega \in [\alpha _{\min },\alpha _{\max }]$. Multiplied by the endpoint-vanishing base schedule $\sigma _0(t)=\lambda \sqrt {t(1-t)}$ they yield the effective bridge width $\sigma $. Level~2 trains $\sigma $ via the heteroscedastic NLL loss $\mathcal {L}_{\mathrm {width}}$, whose pointwise minimum is $\sigma ^{\ast }=\|r\|$ (Prop.~\ref {prop:self-reg}). Level~3 further anchors $\alpha $ to normalized experimental B-factors $\tilde B_i$ via $\mathcal {L}_{\mathrm {bfactor}}$. At inference (dashed path), the same $\sigma $ drives the Euler--Maruyama noise term $\sqrt {\Delta t}\,\sigma \,\xi $. All residuals and embeddings feeding BridgeWidthNet are \emph {detached} from the drift computation graph, so bridge-width gradients do not flow back into the drift network}{figure.1}{}}
+\newlabel{eq:base-schedule}{{6}{5}{Endpoint-safe base schedule and bounded modulation}{equation.6}{}}
+\newlabel{eq:alpha-bounded}{{7}{5}{Endpoint-safe base schedule and bounded modulation}{equation.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why this parameterization.}{5}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Self-regulating training via heteroscedastic NLL}{5}{subsection.4.3}\protected@file@percent }
+\newlabel{subsec:nll}{{4.3}{5}{Self-regulating training via heteroscedastic NLL}{subsection.4.3}{}}
+\citation{nikolayev1997igso3}
+\@writefile{toc}{\contentsline {paragraph}{Residual observations.}{6}{section*.16}\protected@file@percent }
+\newlabel{eq:residual}{{8}{6}{Residual observations}{equation.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Heteroscedastic 1D NLL.}{6}{section*.17}\protected@file@percent }
+\newlabel{eq:nll-def}{{9}{6}{Heteroscedastic 1D NLL}{equation.9}{}}
+\newlabel{eq:width-loss}{{10}{6}{Heteroscedastic 1D NLL}{equation.10}{}}
+\@writefile{toc}{\contentsline {paragraph}{Rotation NLL as a tangent-space approximation.}{6}{section*.18}\protected@file@percent }
+\newlabel{prop:self-reg}{{1}{6}{Self-regulating bridge width}{proposition.1}{}}
+\newlabel{cor:posterior}{{1}{6}{Bayesian posterior variance interpretation}{corollary.1}{}}
+\citation{perez2018film}
+\@writefile{toc}{\contentsline {paragraph}{Why boundedness does not harm the optimum.}{7}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}BridgeWidthNet: architecture for the modulation field}{7}{subsection.4.4}\protected@file@percent }
+\newlabel{subsec:bwnet}{{4.4}{7}{BridgeWidthNet: architecture for the modulation field}{subsection.4.4}{}}
+\newlabel{eq:bwnet-input}{{11}{7}{BridgeWidthNet: architecture for the modulation field}{equation.11}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why geometric residuals, not raw coordinates.}{7}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Level 3: Experimental B-factor anchoring}{7}{subsection.4.5}\protected@file@percent }
+\newlabel{subsec:bfactor}{{4.5}{7}{Level 3: Experimental B-factor anchoring}{subsection.4.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{B-factors as physical flexibility.}{7}{section*.21}\protected@file@percent }
+\citation{foldflow}
+\citation{kloedenplaten1992}
+\citation{foldflow}
+\citation{rnaframeflow}
+\@writefile{toc}{\contentsline {paragraph}{Anchor loss.}{8}{section*.22}\protected@file@percent }
+\newlabel{eq:bfactor-loss}{{12}{8}{Anchor loss}{equation.12}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why this is principled, not a patch.}{8}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Alternative formulation (discussion).}{8}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.6}Theoretical properties}{8}{subsection.4.6}\protected@file@percent }
+\newlabel{subsec:theory}{{4.6}{8}{Theoretical properties}{subsection.4.6}{}}
+\newlabel{prop:endpoint}{{2}{8}{Endpoint preservation}{proposition.2}{}}
+\newlabel{prop:degenerate}{{3}{8}{Degenerate limits}{proposition.3}{}}
+\citation{kabsch1976}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.7}Inference: Euler--Maruyama on $\mathrm  {SE}(3)^L$}{9}{subsection.4.7}\protected@file@percent }
+\newlabel{subsec:inference}{{4.7}{9}{Inference: Euler--Maruyama on $\SE (3)^L$}{subsection.4.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Experiments}{9}{section.5}\protected@file@percent }
+\newlabel{sec:experiments}{{5}{9}{Experiments}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Status note.}{9}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Datasets}{9}{subsection.5.1}\protected@file@percent }
+\newlabel{subsec:exp-data}{{5.1}{9}{Datasets}{subsection.5.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{RNA conformational ensemble dataset.}{9}{section*.26}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{B-factor data (Level 3 only).}{9}{section*.27}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Metrics}{9}{subsection.5.2}\protected@file@percent }
+\newlabel{subsec:exp-metrics}{{5.2}{9}{Metrics}{subsection.5.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Single-structure quality.}{9}{section*.28}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Ensemble coverage and precision.}{10}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Physical validity.}{10}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Uncertainty--flexibility correlation.}{10}{section*.31}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Baselines}{10}{subsection.5.3}\protected@file@percent }
+\newlabel{subsec:exp-baselines}{{5.3}{10}{Baselines}{subsection.5.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Main results}{10}{subsection.5.4}\protected@file@percent }
+\newlabel{subsec:exp-main}{{5.4}{10}{Main results}{subsection.5.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Main results on the RNA conformational ensemble benchmark. Lower AMR and higher COV indicate better ensemble match; higher pairwise RMSD indicates more diversity. $\rho _B$ is Spearman correlation of learned $(\alpha ^x+\alpha ^\omega )/2$ with held-out B-factors. Values are \textcolor {red}{\textbf  {[TODO: placeholders to be filled after training runs]}}.}}{11}{table.2}\protected@file@percent }
+\newlabel{tab:main}{{2}{11}{Main results on the RNA conformational ensemble benchmark. Lower AMR and higher COV indicate better ensemble match; higher pairwise RMSD indicates more diversity. $\rho _B$ is Spearman correlation of learned $(\alpha ^x+\alpha ^\omega )/2$ with held-out B-factors. Values are \todo {placeholders to be filled after training runs}}{table.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Ablation studies. Each row isolates a single design decision. \textcolor {red}{\textbf  {[TODO: Values to be filled.]}}}}{11}{table.3}\protected@file@percent }
+\newlabel{tab:ablation}{{3}{11}{Ablation studies. Each row isolates a single design decision. \todo {Values to be filled.}}{table.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Ablations}{11}{subsection.5.5}\protected@file@percent }
+\newlabel{subsec:exp-ablation}{{5.5}{11}{Ablations}{subsection.5.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{The headline ablation.}{11}{section*.32}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Sensitivity to $\sigma _0$.}{11}{section*.33}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Qualitative: uncertainty field visualization}{11}{subsection.5.6}\protected@file@percent }
+\newlabel{subsec:exp-qual}{{5.6}{11}{Qualitative: uncertainty field visualization}{subsection.5.6}{}}
+\bibstyle{plainnat}
+\bibdata{refs}
+\bibcite{alphafold3}{{1}{2024}{{Abramson et~al.}}{{Abramson, Adler, Dunger, et~al.}}}
+\bibcite{stochasticinterpolants}{{2}{2023}{{Albergo et~al.}}{{Albergo, Boffi, and Vanden-Eijnden}}}
+\bibcite{rnaframeflow}{{3}{2024}{{Anand et~al.}}{{Anand, Joshi, et~al.}}}
+\bibcite{foldflow}{{4}{2024}{{Bose et~al.}}{{Bose, Akhound-Sadegh, Huguet, Fatras, Rector-Brooks, Liu, Nica, Korablyov, Bronstein, and Tong}}}
+\bibcite{chroma}{{5}{2023}{{Ingraham et~al.}}{{Ingraham, Baranov, Costello, Barber, Wang, Ismail, et~al.}}}
+\bibcite{alphaflow}{{6}{2024}{{Jing et~al.}}{{Jing, Berger, and Jaakkola}}}
+\bibcite{kabsch1976}{{7}{1976}{{Kabsch}}{{}}}
+\bibcite{vdm}{{8}{2021}{{Kingma et~al.}}{{Kingma, Salimans, Poole, and Ho}}}
+\bibcite{kloedenplaten1992}{{9}{1992}{{Kloeden and Platen}}{{}}}
+\bibcite{leach2022denoisingso3}{{10}{2022}{{Leach et~al.}}{{Leach, Schmon, Degiacomi, and Willcocks}}}
+\bibcite{bioemu}{{11}{2024}{{Lewis et~al.}}{{Lewis, Hempel, Jim{\'e}nez-Luna, et~al.}}}
+\bibcite{genie}{{12}{2023}{{Lin and AlQuraishi}}{{}}}
+\bibcite{str2str}{{13}{2024}{{Lu et~al.}}{{Lu, Zhong, Zhang, and Tang}}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Discussion and Conclusion}{12}{section.6}\protected@file@percent }
+\newlabel{sec:conclusion}{{6}{12}{Discussion and Conclusion}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Limitations.}{12}{section*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Broader impact.}{12}{section*.35}\protected@file@percent }
+\bibcite{mustoe2014hierarchy}{{14}{2014}{{Mustoe et~al.}}{{Mustoe, Brooks, and Al-Hashimi}}}
+\bibcite{improveddpm}{{15}{2021}{{Nichol and Dhariwal}}{{}}}
+\bibcite{nikolayev1997igso3}{{16}{1997}{{Nikolayev and Savyolov}}{{}}}
+\bibcite{perez2018film}{{17}{2018}{{Perez et~al.}}{{Perez, Strub, {de Vries}, Dumoulin, and Courville}}}
+\bibcite{serganov2013decade}{{18}{2013}{{Serganov and Nudler}}{{}}}
+\bibcite{shi2023dsbm}{{19}{2023}{{Shi et~al.}}{{Shi, {De Bortoli}, Campbell, and Doucet}}}
+\bibcite{rfdiffusion}{{20}{2023}{{Watson et~al.}}{{Watson, Juergens, Bennett, et~al.}}}
+\bibcite{frameflow}{{21}{2023{a}}{{Yim et~al.}}{{Yim, Campbell, Foong, Gastegger, Jim{\'e}nez-Luna, Lewis, Satorras, Veeling, Barzilay, Jaakkola, and Noe}}}
+\bibcite{framediff}{{22}{2023{b}}{{Yim et~al.}}{{Yim, Trippe, {De Bortoli}, Mathieu, Doucet, Barzilay, and Jaakkola}}}
+\bibcite{dig}{{23}{2024}{{Zheng et~al.}}{{Zheng, He, Liu, Shi, Lu, Feng, Ju, Wang, Zhu, Min, et~al.}}}
+\citation{kloedenplaten1992}
+\citation{perez2018film}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Proofs}{14}{appendix.A}\protected@file@percent }
+\newlabel{app:proofs}{{A}{14}{Proofs}{appendix.A}{}}
+\@writefile{toc}{\contentsline {paragraph}{Prop.~\ref {prop:self-reg} (detailed).}{14}{section*.37}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Cor.~\ref {cor:posterior} (detailed).}{14}{section*.38}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Prop.~\ref {prop:endpoint} (detailed).}{14}{section*.39}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Prop.~\ref {prop:degenerate}(a) (detailed).}{14}{section*.40}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Prop.~\ref {prop:degenerate}(b),(c) (detailed).}{14}{section*.41}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {B}Architectural details for BridgeWidthNet}{14}{appendix.B}\protected@file@percent }
+\newlabel{app:arch}{{B}{14}{Architectural details for BridgeWidthNet}{appendix.B}{}}
+\@writefile{toc}{\contentsline {paragraph}{Time conditioning (shared).}{14}{section*.42}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Single-residue path.}{14}{section*.43}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Pair path.}{14}{section*.44}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Backbone.}{14}{section*.45}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Output heads.}{14}{section*.46}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Parameter count.}{15}{section*.47}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {C}B-factor normalization and anchor loss details}{15}{appendix.C}\protected@file@percent }
+\newlabel{app:bfactor}{{C}{15}{B-factor normalization and anchor loss details}{appendix.C}{}}
+\@writefile{toc}{\contentsline {paragraph}{Normalization.}{15}{section*.48}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Alternative: log-sigma alignment.}{15}{section*.49}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {D}Hyperparameters and training details}{15}{appendix.D}\protected@file@percent }
+\newlabel{app:train}{{D}{15}{Hyperparameters and training details}{appendix.D}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Hyperparameters (drift model follows RNA-FrameFlow defaults).}}{15}{table.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {E}Experiment plan and milestone checklist}{15}{appendix.E}\protected@file@percent }
+\newlabel{app:plan}{{E}{15}{Experiment plan and milestone checklist}{appendix.E}{}}
+\@writefile{toc}{\contentsline {paragraph}{Milestone 1: Level 1 baseline reproduction.}{15}{section*.50}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Milestone 2: Level 2 training (self-regulating NLL).}{15}{section*.51}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Milestone 3: Level 3 training (B-factor anchor).}{15}{section*.52}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Milestone 4: Baselines.}{15}{section*.53}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Milestone 5: Evaluation.}{16}{section*.54}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Milestone 6: Qualitative figures.}{16}{section*.55}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Compute budget (estimate).}{16}{section*.56}\protected@file@percent }
+\gdef \@abspage@last{16}

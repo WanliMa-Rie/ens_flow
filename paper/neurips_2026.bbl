@@ -1,0 +1,66 @@
+\begin{thebibliography}{8}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Abramson et~al.(2024)Abramson, Adler, Dunger, Evans, Green, Pritzel,
+  Ronneberger, Willmore, Ballard, Bambrick, et~al.]{abramson2024af3}
+Josh Abramson, Jonas Adler, Jack Dunger, Richard Evans, Tim Green, Alexander
+  Pritzel, Olaf Ronneberger, Lindsay Willmore, Andrew~J Ballard, Joshua
+  Bambrick, et~al.
+\newblock Accurate structure prediction of biomolecular interactions with
+  {A}lpha{F}old~3.
+\newblock \emph{Nature}, 630:\penalty0 493--500, 2024.
+
+\bibitem[Anand et~al.(2025)Anand, Joshi, Morehead, Jamasb, Harris, Mathis,
+  Didi, Ying, Hooi, and Li{\`o}]{anand2025rna}
+Rishabh Anand, Chaitanya~K Joshi, Alex Morehead, Arian~R Jamasb, Charles
+  Harris, Simon~V Mathis, Kieran Didi, Rex Ying, Bryan Hooi, and Pietro
+  Li{\`o}.
+\newblock Rna-frameflow: Flow matching for de novo 3d rna backbone design.
+\newblock \emph{ArXiv}, pages arXiv--2406, 2025.
+
+\bibitem[Bose et~al.(2023)Bose, Akhound-Sadegh, Huguet, Fatras, Rector-Brooks,
+  Liu, Nica, Korablyov, Bronstein, and Tong]{bose2023se}
+Avishek~Joey Bose, Tara Akhound-Sadegh, Guillaume Huguet, Kilian Fatras, Jarrid
+  Rector-Brooks, Cheng-Hao Liu, Andrei~Cristian Nica, Maksym Korablyov, Michael
+  Bronstein, and Alexander Tong.
+\newblock Se (3)-stochastic flow matching for protein backbone generation.
+\newblock \emph{arXiv preprint arXiv:2310.02391}, 2023.
+
+\bibitem[Kendall and Gal(2017)]{kendall2017uncertainties}
+Alex Kendall and Yarin Gal.
+\newblock What uncertainties do we need in {B}ayesian deep learning for
+  computer vision?
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+
+\bibitem[Lipman et~al.(2022)Lipman, Chen, Ben-Hamu, Nickel, and
+  Le]{lipman2022flow}
+Yaron Lipman, Ricky~TQ Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le.
+\newblock Flow matching for generative modeling.
+\newblock \emph{arXiv preprint arXiv:2210.02747}, 2022.
+
+\bibitem[Liu et~al.(2022)Liu, Gong, and Liu]{liu2022flow}
+Xingchao Liu, Chengyue Gong, and Qiang Liu.
+\newblock Flow straight and fast: Learning to generate and transfer data with
+  rectified flow.
+\newblock \emph{arXiv preprint arXiv:2209.03003}, 2022.
+
+\bibitem[Perez et~al.(2018)Perez, Strub, de~Vries, Dumoulin, and
+  Courville]{perez2018film}
+Ethan Perez, Florian Strub, Harm de~Vries, Vincent Dumoulin, and Aaron
+  Courville.
+\newblock {FiLM}: Visual reasoning with a general conditioning layer.
+\newblock In \emph{AAAI Conference on Artificial Intelligence}, 2018.
+
+\bibitem[Yim et~al.(2023)Yim, Campbell, Foong, Gastegger, Jim{\'e}nez-Luna,
+  Lewis, Satorras, Veeling, Barzilay, Jaakkola, et~al.]{yim2023fast}
+Jason Yim, Andrew Campbell, Andrew~YK Foong, Michael Gastegger, Jos{\'e}
+  Jim{\'e}nez-Luna, Sarah Lewis, Victor~Garcia Satorras, Bastiaan~S Veeling,
+  Regina Barzilay, Tommi Jaakkola, et~al.
+\newblock Fast protein backbone generation with se (3) flow matching.
+\newblock \emph{arXiv preprint arXiv:2310.05297}, 2023.
+
+\end{thebibliography}

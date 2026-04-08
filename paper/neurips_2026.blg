@@ -1,0 +1,50 @@
+This is BibTeX, Version 0.99d (TeX Live 2025)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: neurips_2026.aux
+The style file: plainnat.bst
+Database file #1: neurips_2026.bib
+Warning--I didn't find a database entry for "alexander1995template"
+Warning--I didn't find a database entry for "bower1995genesis"
+Warning--I didn't find a database entry for "hasselmo1995dynamics"
+You've used 8 entries,
+            2773 wiz_defined-function locations,
+            635 strings with 6881 characters,
+and the built_in function-call counts, 5366 in all, are:
+= -- 415
+> -- 535
+< -- 2
++ -- 179
+- -- 171
+* -- 490
+:= -- 874
+add.period$ -- 24
+call.type$ -- 8
+change.case$ -- 79
+chr.to.int$ -- 8
+cite$ -- 16
+duplicate$ -- 182
+empty$ -- 297
+format.name$ -- 181
+if$ -- 1073
+int.to.chr$ -- 1
+int.to.str$ -- 1
+missing$ -- 8
+newline$ -- 48
+num.names$ -- 32
+pop$ -- 164
+preamble$ -- 1
+purify$ -- 71
+quote$ -- 0
+skip$ -- 174
+stack$ -- 0
+substring$ -- 86
+swap$ -- 23
+text.length$ -- 1
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 88
+warning$ -- 0
+while$ -- 29
+width$ -- 0
+write$ -- 105
+(There were 3 warnings)
