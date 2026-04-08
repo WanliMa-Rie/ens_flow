@@ -2,6 +2,7 @@ import torch, copy
 from rna_backbone_design.data import so3_utils
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.data import all_atom as rna_all_atom
+from rna_backbone_design.models.bridge_width_net import base_schedule, compute_geometric_residuals
 
 from scipy.spatial.transform import Rotation
 from scipy.optimize import linear_sum_assignment
@@ -122,7 +123,10 @@ class Interpolant:
             batch (dict) : a dictionary where each key is a tensor name and each value is the corresponding tensor of Rigid objects (representing the RNA frames).
 
         Remarks:
-            This method takes in a clean ground truth batch (x_1) and adds returns the interpolated (noised) batch (x_t).
+            This method takes in a clean ground truth batch (x_1) and returns the
+            deterministically interpolated (noised) batch (x_t). The stochastic bridge
+            width sigma only participates in the heteroscedastic NLL loss (Level 2/3)
+            and in inference via Euler-Maruyama; it does NOT enter corruption.
 
         Returns:
             batch of corrupted/noisy/interpolated tensors
@@ -133,7 +137,7 @@ class Interpolant:
         trans_1 = batch["trans_1"]  # # [B, N, 3] (in Angstrom)
         rotmats_1 = batch["rotmats_1"]  # [B, N, 3, 3]
         res_mask = batch["res_mask"]  # [B, N]
-        num_batch, _ = res_mask.shape
+        num_batch = res_mask.shape[0]
 
         # get random timestep in [0, 1] for flow matching
         t = self.sample_t(num_batch)[:, None]  # [B, 1]
@@ -141,10 +145,11 @@ class Interpolant:
 
         # apply corruptions to translations
         trans_t = self._corrupt_trans(trans_1, t, res_mask)
-        noisy_batch["trans_t"] = trans_t
 
         # apply corruptions to rotations
         rotmats_t = self._corrupt_rotmats(rotmats_1, t, res_mask)
+
+        noisy_batch["trans_t"] = trans_t
         noisy_batch["rotmats_t"] = rotmats_t
 
         return noisy_batch
@@ -302,19 +307,21 @@ class Interpolant:
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
 
-    def sample_stochastic(self, num_batch, num_res, model, amplitude_net, context=None):
-        """Stochastic sampling via Euler-Maruyama on SE(3).
+    def sample_stochastic(self, num_batch, num_res, model, bridge_width_net,
+                          context=None, bridge_cfg=None):
+        """Stochastic sampling via Euler-Maruyama on SE(3) with heteroscedastic bridge.
 
-        Uses per-residue translation amplitude σ_x and rotation amplitude σ_ω
-        predicted from noisy state (Z_t, c, t). No B-factor input — amplitudes
-        are purely state-dependent.
+        At each step, the drift model provides a reference prediction from which
+        geometric residuals are computed. BridgeWidthNet then predicts per-residue
+        modulation factors alpha, yielding effective bridge width beta = sigma_0(t) * alpha.
 
         Args:
             num_batch: number of independent samples.
             num_res: number of residues.
             model: drift field network.
-            amplitude_net: AmplitudeNet(trans_t, rotmats_t, single_emb, t).
+            bridge_width_net: BridgeWidthNet predicting (alpha_x, alpha_omega).
             context: conditioning dict (single_embedding, pair_embedding).
+            bridge_cfg: stochastic bridge config with base_schedule params.
 
         Returns:
             (atom37_traj, clean_atom37_traj, clean_traj)
@@ -335,6 +342,7 @@ class Interpolant:
         clean_traj = []
 
         single_emb = context["single_embedding"] if context is not None else None
+        pair_emb = context["pair_embedding"] if context is not None else None
 
         for t_2 in ts[1:]:
             trans_t_1, rotmats_t_1 = prot_traj[-1]
@@ -345,12 +353,25 @@ class Interpolant:
 
             with torch.no_grad():
                 model_out = model(batch)
-                sigma_x, sigma_omega = amplitude_net(
-                    trans_t_1, rotmats_t_1, single_emb, t
+                pred_trans_1 = model_out["pred_trans"]
+                pred_rotmats_1 = model_out["pred_rotmats"]
+
+                # Geometric residuals and bridge width
+                delta_x, delta_omega = compute_geometric_residuals(
+                    trans_t_1, rotmats_t_1, pred_trans_1, pred_rotmats_1
+                )
+                alpha_x, alpha_omega = bridge_width_net(
+                    single_emb, delta_x, delta_omega, pair_emb, t
                 )
 
-            pred_trans_1 = model_out["pred_trans"]
-            pred_rotmats_1 = model_out["pred_rotmats"]
+                # Effective bridge width: beta = sigma_0(t) * alpha
+                t_scalar = t_1.item()
+                t_for_schedule = torch.tensor([[t_scalar]], device=self._device)
+                sigma_0_x = base_schedule(t_for_schedule, bridge_cfg.base_schedule.lambda_x)
+                sigma_0_w = base_schedule(t_for_schedule, bridge_cfg.base_schedule.lambda_omega)
+                beta_x = sigma_0_x.squeeze() * alpha_x
+                beta_omega = sigma_0_w.squeeze() * alpha_omega
+
             clean_traj.append((pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu()))
             if self._cfg.self_condition:
                 batch["trans_sc"] = pred_trans_1
@@ -358,10 +379,10 @@ class Interpolant:
             d_t = t_2 - t_1
 
             trans_t_2 = self._trans_euler_maruyama_step(
-                d_t, t_1, pred_trans_1, trans_t_1, sigma_x
+                d_t, t_1, pred_trans_1, trans_t_1, beta_x
             )
             rotmats_t_2 = self._rots_euler_maruyama_step(
-                d_t, t_1, pred_rotmats_1, rotmats_t_1, sigma_omega
+                d_t, t_1, pred_rotmats_1, rotmats_t_1, beta_omega
             )
             prot_traj.append((trans_t_2, rotmats_t_2))
             t_1 = t_2
@@ -392,68 +413,3 @@ class Interpolant:
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
 
-    def rollout_terminal(self, num_batch, num_res, model, amplitude_net, context=None):
-        """Stochastic rollout returning terminal SE(3) state with grad through amplitude_net.
-
-        Drift model runs in no_grad; amplitude_net retains gradients so L_cov
-        can backprop to ψ. Returns terminal (trans, rotmats, torsions) for
-        atom-wise spread computation.
-
-        Args:
-            num_batch: number of independent rollouts (= M for L_cov).
-            num_res: number of residues.
-            model: drift field network (no_grad).
-            amplitude_net: AmplitudeNet (grad enabled).
-            context: conditioning dict (single_embedding, pair_embedding).
-
-        Returns:
-            trans:    [num_batch, num_res, 3]    terminal translations.
-            rotmats:  [num_batch, num_res, 3, 3] terminal rotations.
-            torsions: [num_batch, num_res, 16]   terminal torsion angles.
-        """
-        res_mask = torch.ones(num_batch, num_res, device=self._device)
-        trans_t = _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
-        rotmats_t = _uniform_so3(num_batch, num_res, self._device)
-
-        batch = {"res_mask": res_mask}
-        if context is not None:
-            batch["single_embedding"] = context["single_embedding"]
-            batch["pair_embedding"] = context["pair_embedding"]
-
-        single_emb = context["single_embedding"] if context is not None else None
-
-        ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
-        t_1 = ts[0]
-
-        for t_2 in ts[1:]:
-            batch["trans_t"] = trans_t
-            batch["rotmats_t"] = rotmats_t
-            t = torch.ones((num_batch, 1), device=self._device) * t_1
-            batch["t"] = t
-
-            with torch.no_grad():
-                model_out = model(batch)
-            sigma_x, sigma_omega = amplitude_net(trans_t, rotmats_t, single_emb, t)
-
-            pred_trans_1 = model_out["pred_trans"]
-            pred_rotmats_1 = model_out["pred_rotmats"]
-            if self._cfg.self_condition:
-                batch["trans_sc"] = pred_trans_1
-
-            d_t = t_2 - t_1
-            trans_t = self._trans_euler_maruyama_step(
-                d_t, t_1, pred_trans_1, trans_t, sigma_x
-            )
-            rotmats_t = self._rots_euler_maruyama_step(
-                d_t, t_1, pred_rotmats_1, rotmats_t, sigma_omega
-            )
-            t_1 = t_2
-
-        # Final model call to get torsions
-        batch["trans_t"] = trans_t
-        batch["rotmats_t"] = rotmats_t
-        batch["t"] = torch.ones((num_batch, 1), device=self._device) * ts[-1]
-        with torch.no_grad():
-            model_out = model(batch)
-
-        return trans_t, rotmats_t, model_out["pred_torsions"]

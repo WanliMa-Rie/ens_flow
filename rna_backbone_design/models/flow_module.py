@@ -23,10 +23,12 @@ from rna_backbone_design.data.interpolant import Interpolant
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.data import all_atom as rna_all_atom
 from rna_backbone_design.data import so3_utils
-from scipy.spatial.transform import Rotation
 from rna_backbone_design.data import nucleotide_constants
 from rna_backbone_design.analysis import utils as au
 from rna_backbone_design.data import fk_utils
+from rna_backbone_design.models.bridge_width_net import (
+    BridgeWidthNet, base_schedule, compute_geometric_residuals,
+)
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 
@@ -45,13 +47,11 @@ class FlowModule(LightningModule):
         # Set-up interpolant
         self.interpolant = Interpolant(cfg.interpolant)
 
-        # fk_flow: optional stochastic diffusion amplitude with Feynman-Kac framework
-        self._fk_cfg = getattr(cfg, 'fk_flow', None)
-        self._fk_enabled = self._fk_cfg is not None and self._fk_cfg.enabled
-        if self._fk_enabled:
-            from rna_backbone_design.models.amplitude_net import AmplitudeNet, UncertaintyNet
-            self.amplitude_net = AmplitudeNet(**self._fk_cfg.amplitude_net)
-            self.uncertainty_net = UncertaintyNet(**self._fk_cfg.uncertainty_net)
+        # Stochastic bridge configuration (Level 1/2/3)
+        self._bridge_cfg = getattr(cfg, 'stochastic_bridge', None)
+        self._level = int(self._bridge_cfg.level) if self._bridge_cfg is not None else 1
+        if self._level >= 2:
+            self.bridge_width_net = BridgeWidthNet(**self._bridge_cfg.bridge_width_net)
 
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
@@ -94,10 +94,14 @@ class FlowModule(LightningModule):
             noisy_batch (dict) : dictionary of tensors corresponding to corrupted Frame objects
 
         Remarks:
-            Computes the different core and auxiliary losses between ground truth and predicted backbones
+            Computes the different core and auxiliary losses between ground truth and predicted backbones.
+            Also returns the raw FlowModel output so downstream modules (e.g. BridgeWidthNet
+            supervision) can reuse it without a redundant forward pass.
 
         Returns:
-            Dictionary of core and auxiliary losses
+            (batch_losses, model_output)
+                batch_losses: dict of core and auxiliary losses
+                model_output: dict returned by FlowModel (pred_trans, pred_rotmats, pred_torsions, ...)
         """
         training_cfg = self._exp_cfg.training
         loss_mask = noisy_batch["res_mask"]
@@ -265,7 +269,7 @@ class FlowModule(LightningModule):
             print("NaN loss in se3_vf_loss")
             se3_vf_loss = se3_vf_loss * 0.0
 
-        return {
+        batch_losses = {
             "bb_atom_loss": bb_atom_loss,
             "trans_loss": trans_loss,
             "dist_mat_loss": dist_mat_loss,
@@ -274,6 +278,7 @@ class FlowModule(LightningModule):
             "se3_vf_loss": se3_vf_loss,
             "torsion_loss": tors_loss,
         }
+        return batch_losses, model_output
 
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         """
@@ -307,10 +312,10 @@ class FlowModule(LightningModule):
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
 
-            if self._fk_enabled:
+            if self._level >= 2:
                 atom37_traj, _, _ = self.interpolant.sample_stochastic(
-                    num_generated, num_res, self.model, self.amplitude_net,
-                    context=context,
+                    num_generated, num_res, self.model, self.bridge_width_net,
+                    context=context, bridge_cfg=self._bridge_cfg,
                 )
             else:
                 atom37_traj, _, _ = self.interpolant.sample(
@@ -393,9 +398,8 @@ class FlowModule(LightningModule):
                 model_sc = self.model(noisy_batch)
                 noisy_batch["trans_sc"] = model_sc["pred_trans"]
 
-        batch_losses = self.model_step(noisy_batch)
+        batch_losses, model_output = self.model_step(noisy_batch)
         num_batch = batch_losses["bb_atom_loss"].shape[0]
-        num_res = batch["res_mask"].shape[1]
         total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
 
         for k, v in total_losses.items():
@@ -408,36 +412,16 @@ class FlowModule(LightningModule):
                 batch_size=num_batch,
             )
 
-        # # Losses to track. Stratified across t.
-        # t = torch.squeeze(noisy_batch["t"])
-        # self._log_scalar(
-        #     "train/t", np.mean(du.to_numpy(t)), prog_bar=False, batch_size=num_batch
-        # )
-        # for loss_name, loss_dict in batch_losses.items():
-        #     stratified_losses = mu.t_stratified_loss(t, loss_dict, loss_name=loss_name)
-        #     for k, v in stratified_losses.items():
-        #         self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
-
-        # # Training throughput
-        # self._log_scalar(
-        #     "train/length",
-        #     batch["res_mask"].shape[1],
-        #     prog_bar=False,
-        #     batch_size=num_batch,
-        # )
-        # self._log_scalar("train/batch_size", num_batch, prog_bar=False)
-        #
-        # step_time = time.time() - step_start_time
-        # self._log_scalar("train/eps", num_batch / step_time)
-
         train_loss = (
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
 
-        # Feynman-Kac B-factor supervision (§4 of bfactor_frameworks.md)
-        if self._fk_enabled:
-            fk_loss = self._feynman_kac_step(batch, noisy_batch, num_batch)
-            train_loss = train_loss + fk_loss
+        # BridgeWidthNet training (Level 2: heteroscedastic NLL on drift residual;
+        # Level 3: + direct B-factor anchor). Reuses model_output from model_step,
+        # detached, so bridge gradients never touch the drift model.
+        if self._level >= 2:
+            bridge_loss = self._bridge_width_step(noisy_batch, model_output, num_batch)
+            train_loss = train_loss + bridge_loss
 
         self.log(
             "pbar/loss",
@@ -460,97 +444,149 @@ class FlowModule(LightningModule):
 
         return train_loss
 
-    def _feynman_kac_step(self, batch, noisy_batch, num_batch):
-        """Compute Feynman-Kac losses: L_TD + L_term + L_init.
+    def _bridge_width_step(self, noisy_batch, model_output, num_batch):
+        """Train BridgeWidthNet via a heteroscedastic NLL on the drift residual.
 
-        Per-residue scalar U_i(t) tracks remaining flexibility budget.
-        q_i = σ_x² + σ_ω² is the instantaneous rate (model decides the split).
-        B-factor target is per-nucleotide average.
+        The learnable Brownian-bridge width is
+            sigma(t, i) = sigma_0(t) * alpha(t, i)
+        with alpha predicted by BridgeWidthNet from (single, pair, Δx, Δω, t).
+
+        We place a Gaussian predictive model on the drift residual
+            r_x(i) = ||pred_trans_1(i) - trans_1(i)||
+            r_w(i) = ||log(rotmats_1(i)^T @ pred_rotmats_1(i))||
+        and maximize its log-likelihood under std = sigma(t, i):
+            L_i = r_i^2 / sigma_i^2 + log(sigma_i^2)
+
+        Drift-model decoupling: r is detached, and the geometric-residual inputs
+        to BridgeWidthNet use detached pred_*. Consequently the bridge loss's
+        gradients only flow into BridgeWidthNet — drift is trained purely by the
+        standard SE(3) flow loss in model_step. The coupling is purely through
+        what sigma "sees" at inference.
+
+        Level 3 adds a direct anchor from normalized experimental B-factor.
         """
-        fk_cfg = self._fk_cfg.loss
-        device = batch["res_mask"].device
-        num_res = batch["res_mask"].shape[1]
-        single_emb = batch["single_embedding"]
-        res_mask = batch["res_mask"]  # [B, N]
+        bridge_cfg = self._bridge_cfg
+        res_mask = noisy_batch["res_mask"]  # [B, N]
+        single_emb = noisy_batch["single_embedding"]
+        pair_emb = noisy_batch["pair_embedding"]
+        t = noisy_batch["t"]  # [B, 1]
 
-        # Per-residue average B-factor target
-        b_factors = batch["b_factors"]  # [B, N] (per-residue, e.g. C4' or average)
-        b_target = fk_utils.normalize_b_factors_positive(b_factors, res_mask)  # [B, N]
+        # Detached references — freeze drift gradients out of the bridge loss
+        pred_trans_1 = model_output["pred_trans"].detach()
+        pred_rotmats_1 = model_output["pred_rotmats"].detach()
 
-        # Reuse the batch's interpolated state as t1
-        trans_1 = batch["trans_1"]
-        rotmats_1 = batch["rotmats_1"]
-        trans_t1 = noisy_batch["trans_t"]
-        rotmats_t1 = noisy_batch["rotmats_t"]
-        t1 = noisy_batch["t"]  # [B, 1]
-
-        # t2 uniformly in (t1, 1)
-        t2_raw = torch.rand(num_batch, device=device)
-        t2 = t1[:, 0] + (1.0 - t1[:, 0]) * t2_raw
-        t2 = t2.clamp(max=1.0 - 1e-3)[:, None]  # [B, 1]
-
-        # Interpolate t2 state from t1 toward x1
-        frac = ((t2 - t1) / (1 - t1)).clamp(min=0, max=1)
-        trans_t2 = trans_t1 + frac[..., None] * (trans_1 - trans_t1)
-        rotmats_t2 = so3_utils.geodesic_t(frac[..., None], rotmats_1, rotmats_t1)
-
-        # AmplitudeNet → instantaneous flexibility rate q = σ_x² + σ_ω²
-        sx1, sw1 = self.amplitude_net(trans_t1, rotmats_t1, single_emb, t1)
-        sx2, sw2 = self.amplitude_net(trans_t2, rotmats_t2, single_emb, t2)
-        q_t1 = fk_utils.compute_flexibility_rate(sx1, sw1)  # [B, N]
-        q_t2 = fk_utils.compute_flexibility_rate(sx2, sw2)  # [B, N]
-
-        # UncertaintyNet → remaining budget U_i(t)
-        U_t1 = self.uncertainty_net(trans_t1, rotmats_t1, single_emb, t1)  # [B, N]
-        U_t2 = self.uncertainty_net(trans_t2, rotmats_t2, single_emb, t2)  # [B, N]
-
-        # --- L_TD: semi-gradient temporal consistency ---
-        dt = t2 - t1  # [B, 1]
-        q_bar = 0.5 * (q_t1 + q_t2)  # [B, N]
-        td_target = (U_t2.detach() + q_bar.detach() * dt)
-        td_loss = ((U_t1 - td_target) ** 2 * res_mask).sum() / res_mask.sum().clamp(min=1)
-
-        # --- L_term: U(1) = 0 ---
-        t_one = torch.ones(num_batch, 1, device=device)
-        U_term = self.uncertainty_net(trans_1, rotmats_1, single_emb, t_one)
-        term_loss = (U_term ** 2 * res_mask).sum() / res_mask.sum().clamp(min=1)
-
-        # --- L_init: U(0) = B_norm ---
-        t_zero = torch.full((num_batch, 1), self._interpolant_cfg.min_t, device=device)
-        noise = torch.randn(num_batch, num_res, 3, device=device)
-        trans_t0 = (noise - noise.mean(dim=1, keepdim=True)) * du.NM_TO_ANG_SCALE
-        rotmats_t0 = torch.tensor(
-            Rotation.random(num_batch * num_res).as_matrix(),
-            device=device, dtype=torch.float32,
-        ).reshape(num_batch, num_res, 3, 3)
-        U_init = self.uncertainty_net(trans_t0, rotmats_t0, single_emb, t_zero)
-        init_loss = ((U_init - b_target) ** 2 * res_mask).sum() / res_mask.sum().clamp(min=1)
-
-        # Total
-        fk_loss = (
-            fk_cfg.td_weight * td_loss
-            + fk_cfg.term_weight * term_loss
-            + fk_cfg.init_weight * init_loss
+        # Geometric residuals (BridgeWidthNet inputs)
+        delta_x, delta_omega = compute_geometric_residuals(
+            noisy_batch["trans_t"], noisy_batch["rotmats_t"],
+            pred_trans_1, pred_rotmats_1,
         )
 
-        for name, val in [("td_loss", td_loss), ("term_loss", term_loss), ("init_loss", init_loss)]:
+        alpha_x, alpha_omega = self.bridge_width_net(
+            single_emb, delta_x, delta_omega, pair_emb, t
+        )  # [B, N], [B, N]
+
+        # Heteroscedastic std: sigma = sigma_0(t) * alpha
+        sigma_0_x = base_schedule(t, bridge_cfg.base_schedule.lambda_x)      # [B, 1]
+        sigma_0_w = base_schedule(t, bridge_cfg.base_schedule.lambda_omega)  # [B, 1]
+        sigma_x = sigma_0_x * alpha_x       # [B, N]
+        sigma_w = sigma_0_w * alpha_omega   # [B, N]
+
+        # Drift residual norms (detached — these are the NLL "observations")
+        with torch.no_grad():
+            r_x = (pred_trans_1 - noisy_batch["trans_1"]).norm(dim=-1)  # [B, N]
+            rot_err_vec = so3_utils.calc_rot_vf(
+                noisy_batch["rotmats_1"], pred_rotmats_1
+            )
+            r_w = rot_err_vec.norm(dim=-1)  # [B, N]
+
+        eps = 1e-6
+        var_x = sigma_x ** 2 + eps
+        var_w = sigma_w ** 2 + eps
+        nll_x = r_x ** 2 / var_x + torch.log(var_x)
+        nll_w = r_w ** 2 / var_w + torch.log(var_w)
+
+        # Per-modality loss weights matching Level 1's convention. Translation
+        # lives in Angstroms and rotation in radians; Level 1 balances the two
+        # modalities via translation_loss_weight : rotation_loss_weights (2.0 : 1.0
+        # under the current config). We reuse the same weights here so that
+        # Level 1 and Level 2 share one single unit-balancing convention, and
+        # σ remains in raw physical units (Å / rad) at both training and inference.
+        training_cfg = self._exp_cfg.training
+        w_x = training_cfg.translation_loss_weight
+        w_w = training_cfg.rotation_loss_weights
+        w_sum = w_x + w_w
+
+        mask_sum = res_mask.sum().clamp(1.0)
+        weighted_nll = w_x * nll_x + w_w * nll_w
+        width_loss = (weighted_nll * res_mask).sum() / mask_sum / w_sum
+
+        total_bridge_loss = bridge_cfg.width_loss_weight * width_loss
+
+        self._log_scalar(
+            "train/bridge_width_nll", width_loss,
+            on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+        )
+        with torch.no_grad():
+            # Log the two modalities separately so the scale balance is visible.
             self._log_scalar(
-                f"train/fk_{name}", val,
+                "train/bridge_nll_x",
+                (nll_x * res_mask).sum() / mask_sum,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+            self._log_scalar(
+                "train/bridge_nll_w",
+                (nll_w * res_mask).sum() / mask_sum,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+            self._log_scalar(
+                "train/bridge_alpha_x_mean",
+                (alpha_x * res_mask).sum() / mask_sum,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+            self._log_scalar(
+                "train/bridge_alpha_w_mean",
+                (alpha_omega * res_mask).sum() / mask_sum,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+            # Also log raw residual magnitudes so you can calibrate lambda_x / lambda_omega
+            # against the actual drift-residual scale encountered during training.
+            self._log_scalar(
+                "train/bridge_r_x_mean",
+                (r_x * res_mask).sum() / mask_sum,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+            self._log_scalar(
+                "train/bridge_r_w_mean",
+                (r_w * res_mask).sum() / mask_sum,
                 on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
             )
 
-        return fk_loss
+        # --- Level 3: B-factor anchor on alpha (physical flexibility) ---
+        if self._level >= 3:
+            b_target = fk_utils.normalize_b_factors_positive(
+                noisy_batch["b_factors"], res_mask
+            )
+            bf_loss = (
+                ((alpha_x - b_target) ** 2 + (alpha_omega - b_target) ** 2) * res_mask
+            ).sum() / mask_sum / 2.0
+            total_bridge_loss = total_bridge_loss + bridge_cfg.bfactor_supervision.weight * bf_loss
+            self._log_scalar(
+                "train/bridge_bfactor_loss", bf_loss,
+                on_step=False, on_epoch=True, prog_bar=False, batch_size=num_batch,
+            )
+
+        return total_bridge_loss
 
     def configure_optimizers(self):
-        if not self._fk_enabled:
+        if self._level == 1:
             return torch.optim.AdamW(
                 params=self.model.parameters(), **self._exp_cfg.optimizer
             )
-        drift_lr = self._exp_cfg.optimizer.lr * self._fk_cfg.drift_lr_scale
+        # Level 2/3: separate param groups for drift model and bridge width net
+        drift_lr = self._exp_cfg.optimizer.lr * self._bridge_cfg.drift_lr_scale
         param_groups = [
             {"params": self.model.parameters(), "lr": drift_lr},
-            {"params": self.amplitude_net.parameters(), "lr": self._fk_cfg.optimizer.lr},
-            {"params": self.uncertainty_net.parameters(), "lr": self._fk_cfg.optimizer.lr},
+            {"params": self.bridge_width_net.parameters(), "lr": self._bridge_cfg.optimizer.lr},
         ]
         return torch.optim.AdamW(param_groups)
 
@@ -591,10 +627,10 @@ class FlowModule(LightningModule):
                 "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
-            if self._fk_enabled:
+            if self._level >= 2:
                 atom37_traj, _, _ = interpolant.sample_stochastic(
-                    num_generated, num_res, self.model, self.amplitude_net,
-                    context=context,
+                    num_generated, num_res, self.model, self.bridge_width_net,
+                    context=context, bridge_cfg=self._bridge_cfg,
                 )
             else:
                 atom37_traj, _, _ = interpolant.sample(

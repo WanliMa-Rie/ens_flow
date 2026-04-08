@@ -61,7 +61,7 @@ experiment:
   validation:
     num_generated: 50
   wandb:
-    name: td-flow
+    name: 2_test
     project: ens_flow
     save_code: false
     tags: []
@@ -84,24 +84,28 @@ experiment:
   checkpointer:
     dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
 
-fk_flow:
-  enabled: true
-  amplitude_net:
+stochastic_bridge:
+  level: 2                    # 1=deterministic flow, 2=heteroscedastic bridge, 3=bridge+B-factor
+  bridge_width_net:
     c_single_in: ${model.node_features.c_single_in}  # 384
+    c_pair_in: ${model.edge_features.c_pair_in}      # 128
     timestep_embed_dim: 64
     hidden_dim: 128
     num_layers: 4
     kernel_size: 5
-  uncertainty_net:
-    c_single_in: ${model.node_features.c_single_in}  # 384
-    timestep_embed_dim: 64
-    hidden_dim: 128
-    num_layers: 4
-    kernel_size: 5
-  loss:
-    td_weight: 1.0
-    term_weight: 1.0
-    init_weight: 1.0
+    alpha_min: 0.1
+    alpha_max: 3.0
+  base_schedule:
+    # lambda_x is in raw Angstroms (Option B: NLL stays in physical units).
+    # Target: sigma_x^0(t=0.5) = lambda_x/2 ≈ typical r_x magnitude, so that
+    # alpha_x^* = r_x / sigma_x^0 lands near 1.0 (center of [0.1, 3.0]).
+    # For RNA backbones the typical mid-training drift residual r_x is ~2 Å,
+    # giving lambda_x ≈ 4.0. Calibrate via the train/bridge_r_x_mean log.
+    lambda_x: 4.0
+    lambda_omega: 0.5           # Rotation already in rad, typical r_w ~ 0.25 rad at t=0.5
+  width_loss_weight: 1.0        # Global scale on top of the per-modality weighted NLL
+  bfactor_supervision:
+    weight: 1.0
   optimizer:
     lr: 0.0003
   drift_lr_scale: 0.1
