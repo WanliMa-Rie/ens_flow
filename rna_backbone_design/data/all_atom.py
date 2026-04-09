@@ -61,10 +61,16 @@ def transrot_to_atom37_rna(transrot_traj, is_na_residue_mask, torsions):
 
     for trans, rots in transrot_traj:
         rigids = create_rna_rigid(rots, trans)
+        # `clean_traj` entries are already moved to CPU in `sample()`/
+        # `sample_bridge()`, while `prot_traj` entries stay on GPU. Align the
+        # mask and torsions to whichever device the trajectory tensors live on
+        # so the boolean indexing inside `compute_backbone` does not cross the
+        # CPU/GPU boundary.
+        device = trans.device
         rna_atom37 = compute_backbone(
                 bb_rigids=rigids,
-                torsions=torsions, # 16 -> NUM_NA_TORSIONS * 2
-                is_na_residue_mask=is_na_residue_mask,
+                torsions=torsions.to(device), # 16 -> NUM_NA_TORSIONS * 2
+                is_na_residue_mask=is_na_residue_mask.to(device),
             )[0]
         rna_atom37 = rna_atom37.detach().cpu()
         atom37_traj.append(rna_atom37)

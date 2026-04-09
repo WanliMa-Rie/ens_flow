@@ -12,68 +12,66 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Flexibility Modeling}{1}{subsection.2.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {3}Methodology}{1}{section.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Problem Definition}{1}{subsection.3.1}\protected@file@percent }
-\citation{abramson2024af3}
-\citation{abramson2024af3}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {ResBridge framework.} \textbf  {Stage~I.} An RNA sequence $s$ is encoded once by a frozen AlphaFold3 Pairformer~\cite  {abramson2024af3} into a single representation $\mathbf  {c}^{(s)}\!\in \!\mathbb  {R}^{L\times 384}$ and a pair representation $\mathbf  {c}^{(p)}\!\in \!\mathbb  {R}^{L\times L\times 128}$, jointly written $\mathbf  {c}$. \textbf  {Stage~II.} The deterministic drift $f_\theta $ of \S  \ref {sec:se3-fm} consumes $(G_t,\mathbf  {c},t)$ and predicts the clean state $\hat  {G}_1$, supervised by the SE(3) regression loss \eqref  {eq:fm-loss}. The bridge width network $g_\phi $ reuses the same $\mathbf  {c}$ and the geometric residuals \eqref  {eq:geom-residual} computed from \emph  {stop-gradient} $\hat  {G}_1$, and emits per-residue bounded modulations $\alpha ^{m}_i\!\in \![\alpha _{\min },\alpha _{\max }]$ that scale the endpoint-safe base schedule into $\sigma ^{m}_{i,t}=\sigma _{0}^{m}(t)\!\cdot \!\alpha ^{m}_{i}$, trained by the heteroscedastic NLL \eqref  {eq:bridge-nll}. The dashed \textsf  {sg} arrow is the architectural \emph  {stop-gradient firewall} that decouples the two losses: gradients of $\mathcal  {L}_{\mathrm  {NLL}}$ never reach $\theta $, so $f_\theta $ converges to the same vector field as in the deterministic SE(3) flow matching backbone. The optional B-factor anchor (Level~3, \S  \ref {sec:resbridge-guided}) supplies an experimental flexibility prior on $\sigma $. \textbf  {Stage~III.} The drift velocity $v_t$ and the bridge width $\sigma $ enter a single Euler--Maruyama step on $SE(3)^L$ \eqref  {eq:bridge-em}; iterating $T$ steps from independent $G_0\!\sim \!p_0$ produces a conformational ensemble $\{G_1^{(k)}\}_{k=1}^{K}$.}}{2}{figure.1}\protected@file@percent }
-\newlabel{fig:framework}{{1}{2}{\textbf {ResBridge framework.} \textbf {Stage~I.} An RNA sequence $s$ is encoded once by a frozen AlphaFold3 Pairformer~\cite {abramson2024af3} into a single representation $\mathbf {c}^{(s)}\!\in \!\mathbb {R}^{L\times 384}$ and a pair representation $\mathbf {c}^{(p)}\!\in \!\mathbb {R}^{L\times L\times 128}$, jointly written $\mathbf {c}$. \textbf {Stage~II.} The deterministic drift $f_\theta $ of \S \ref {sec:se3-fm} consumes $(G_t,\mathbf {c},t)$ and predicts the clean state $\hat {G}_1$, supervised by the SE(3) regression loss \eqref {eq:fm-loss}. The bridge width network $g_\phi $ reuses the same $\mathbf {c}$ and the geometric residuals \eqref {eq:geom-residual} computed from \emph {stop-gradient} $\hat {G}_1$, and emits per-residue bounded modulations $\alpha ^{m}_i\!\in \![\alpha _{\min },\alpha _{\max }]$ that scale the endpoint-safe base schedule into $\sigma ^{m}_{i,t}=\sigma _{0}^{m}(t)\!\cdot \!\alpha ^{m}_{i}$, trained by the heteroscedastic NLL \eqref {eq:bridge-nll}. The dashed \textsf {sg} arrow is the architectural \emph {stop-gradient firewall} that decouples the two losses: gradients of $\mathcal {L}_{\mathrm {NLL}}$ never reach $\theta $, so $f_\theta $ converges to the same vector field as in the deterministic SE(3) flow matching backbone. The optional B-factor anchor (Level~3, \S \ref {sec:resbridge-guided}) supplies an experimental flexibility prior on $\sigma $. \textbf {Stage~III.} The drift velocity $v_t$ and the bridge width $\sigma $ enter a single Euler--Maruyama step on $SE(3)^L$ \eqref {eq:bridge-em}; iterating $T$ steps from independent $G_0\!\sim \!p_0$ produces a conformational ensemble $\{G_1^{(k)}\}_{k=1}^{K}$}{figure.1}{}}
+\citation{leach2022denoising,yim2023se}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.2}SE(3) Flow Matching Backbone}{2}{subsection.3.2}\protected@file@percent }
 \newlabel{sec:se3-fm}{{3.2}{2}{SE(3) Flow Matching Backbone}{subsection.3.2}{}}
 \newlabel{eq:fm-loss}{{2}{2}{SE(3) Flow Matching Backbone}{equation.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}ResBridge}{2}{subsection.3.3}\protected@file@percent }
-\newlabel{sec:resbridge}{{3.3}{2}{ResBridge}{subsection.3.3}{}}
-\citation{perez2018film}
-\@writefile{toc}{\contentsline {paragraph}{Stochastic bridge on $SE(3)^L$.}{3}{section*.1}\protected@file@percent }
-\newlabel{eq:bridge-sde}{{3}{3}{Stochastic bridge on $SE(3)^L$}{equation.3}{}}
-\newlabel{eq:bridge-em}{{4}{3}{Stochastic bridge on $SE(3)^L$}{equation.4}{}}
-\newlabel{eq:bridge-width}{{5}{3}{Stochastic bridge on $SE(3)^L$}{equation.5}{}}
-\@writefile{toc}{\contentsline {paragraph}{Bridge width network.}{3}{section*.2}\protected@file@percent }
-\newlabel{eq:geom-residual}{{6}{3}{Bridge width network}{equation.6}{}}
-\newlabel{eq:alpha-bound}{{7}{3}{Bridge width network}{equation.7}{}}
-\@writefile{toc}{\contentsline {paragraph}{Heteroscedastic self-regulating NLL.}{3}{section*.3}\protected@file@percent }
-\newlabel{eq:bridge-residual}{{8}{3}{Heteroscedastic self-regulating NLL}{equation.8}{}}
-\citation{kendall2017uncertainties}
-\newlabel{eq:bridge-nll}{{9}{4}{Heteroscedastic self-regulating NLL}{equation.9}{}}
-\newlabel{eq:bridge-optimal}{{10}{4}{Heteroscedastic self-regulating NLL}{equation.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}ResBridge: a tangent-space-lifted stochastic bridge}{2}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:resbridge}{{3.3}{2}{ResBridge: a tangent-space-lifted stochastic bridge}{subsection.3.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Three properties.}{2}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Tangent-space-lifted bridge on $SE(3)^L$.}{2}{section*.2}\protected@file@percent }
+\newlabel{eq:trans-bridge}{{3}{2}{Tangent-space-lifted bridge on $SE(3)^L$}{equation.3}{}}
+\newlabel{eq:rel-omega}{{4}{2}{Tangent-space-lifted bridge on $SE(3)^L$}{equation.4}{}}
+\newlabel{eq:tangent-bridge}{{5}{2}{Tangent-space-lifted bridge on $SE(3)^L$}{equation.5}{}}
+\newlabel{eq:rot-bridge}{{6}{2}{Tangent-space-lifted bridge on $SE(3)^L$}{equation.6}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {ResBridge framework (Level~2).} ResBridge replaces the deterministic conditional path of \S  \ref {sec:se3-fm} with two closed-form Brownian bridges (red), one in $\mathbb  {R}^{3}$ for translations and one in the tangent space $\mathfrak  {so}(3)\!\cong  \!\mathbb  {R}^{3}$ for rotations, the latter pushed back to $SO(3)$ through the exponential map at $R_{0}$. The corrupted state $G_{t}=(x_{t},R_{t})$ is fed into the same drift network $v_{\theta }$ (blue) as in the deterministic backbone of \S  \ref {sec:se3-fm}, supervised by the same flow matching loss \eqref  {eq:fm-loss}; the only inference change is to replace the ODE Euler step by the Euler--Maruyama step \eqref  {eq:bridge-em}. ResBridge therefore introduces \emph  {no new trainable parameter and no new loss term}, and strictly contains the deterministic backbone in the limit $\sigma _{x}{=}\sigma _{R}{=}0$.}}{3}{figure.1}\protected@file@percent }
+\newlabel{fig:framework}{{1}{3}{\textbf {ResBridge framework (Level~2).} ResBridge replaces the deterministic conditional path of \S \ref {sec:se3-fm} with two closed-form Brownian bridges (red), one in $\mathbb {R}^{3}$ for translations and one in the tangent space $\mathfrak {so}(3)\!\cong \!\mathbb {R}^{3}$ for rotations, the latter pushed back to $SO(3)$ through the exponential map at $R_{0}$. The corrupted state $G_{t}=(x_{t},R_{t})$ is fed into the same drift network $v_{\theta }$ (blue) as in the deterministic backbone of \S \ref {sec:se3-fm}, supervised by the same flow matching loss \eqref {eq:fm-loss}; the only inference change is to replace the ODE Euler step by the Euler--Maruyama step \eqref {eq:bridge-em}. ResBridge therefore introduces \emph {no new trainable parameter and no new loss term}, and strictly contains the deterministic backbone in the limit $\sigma _{x}{=}\sigma _{R}{=}0$}{figure.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Honest framing.}{3}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Endpoints, conditional law, and drift.}{3}{section*.4}\protected@file@percent }
+\citation{lipman2022flow,tong2024improving}
+\citation{yim2023fast}
+\newlabel{eq:bridge-target}{{7}{4}{Endpoints, conditional law, and drift}{equation.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Centered translation prior.}{4}{section*.5}\protected@file@percent }
+\newlabel{eq:trans-recenter}{{8}{4}{Centered translation prior}{equation.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Sampling.}{4}{section*.6}\protected@file@percent }
+\newlabel{eq:bridge-em}{{9}{4}{Sampling}{equation.9}{}}
+\@writefile{toc}{\contentsline {paragraph}{Strict containment of the deterministic backbone.}{4}{section*.7}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.4}ResBridge-guided}{4}{subsection.3.4}\protected@file@percent }
 \newlabel{sec:resbridge-guided}{{3.4}{4}{ResBridge-guided}{subsection.3.4}{}}
-\@writefile{toc}{\contentsline {paragraph}{B-factor as physical flexibility.}{4}{section*.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Retrieval of style files}{4}{subsection.3.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Preprint option}{5}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{B-factor as physical flexibility.}{4}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Retrieval of style files}{5}{subsection.3.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {4}General formatting instructions}{5}{section.4}\protected@file@percent }
 \newlabel{gen_inst}{{4}{5}{General formatting instructions}{section.4}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {5}Headings: first level}{5}{section.5}\protected@file@percent }
 \newlabel{headings}{{5}{5}{Headings: first level}{section.5}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Headings: second level}{5}{subsection.5.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsubsection}{\numberline {5.1.1}Headings: third level}{5}{subsubsection.5.1.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Paragraphs}{5}{section*.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Citations, figures, tables, references}{6}{section.6}\protected@file@percent }
-\newlabel{others}{{6}{6}{Citations, figures, tables, references}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Paragraphs}{5}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Citations, figures, tables, references}{5}{section.6}\protected@file@percent }
+\newlabel{others}{{6}{5}{Citations, figures, tables, references}{section.6}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Sample figure caption. Explain what the figure shows and add a key take-away message to the caption.}}{6}{figure.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Citations within the text}{6}{subsection.6.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Footnotes}{6}{subsection.6.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Figures}{6}{subsection.6.3}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Sample figure caption. Explain what the figure shows and add a key take-away message to the caption.}}{7}{figure.2}\protected@file@percent }
 \@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Sample table caption. Explain what the table shows and add a key take-away message to the caption.}}{7}{table.1}\protected@file@percent }
 \newlabel{sample-table}{{1}{7}{Sample table caption. Explain what the table shows and add a key take-away message to the caption}{table.1}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Tables}{7}{subsection.6.4}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Math}{7}{subsection.6.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.6}Final instructions}{7}{subsection.6.6}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {7}Preparing PDF files}{7}{section.7}\protected@file@percent }
-\citation{alexander1995template}
-\citation{bower1995genesis}
-\citation{hasselmo1995dynamics}
 \bibstyle{plainnat}
 \bibdata{neurips_2026}
-\bibcite{abramson2024af3}{{1}{2024}{{Abramson et~al.}}{{Abramson, Adler, Dunger, Evans, Green, Pritzel, Ronneberger, Willmore, Ballard, Bambrick, et~al.}}}
-\bibcite{anand2025rna}{{2}{2025}{{Anand et~al.}}{{Anand, Joshi, Morehead, Jamasb, Harris, Mathis, Didi, Ying, Hooi, and Li{\`o}}}}
-\bibcite{bose2023se}{{3}{2023}{{Bose et~al.}}{{Bose, Akhound-Sadegh, Huguet, Fatras, Rector-Brooks, Liu, Nica, Korablyov, Bronstein, and Tong}}}
-\bibcite{kendall2017uncertainties}{{4}{2017}{{Kendall and Gal}}{{}}}
-\bibcite{lipman2022flow}{{5}{2022}{{Lipman et~al.}}{{Lipman, Chen, Ben-Hamu, Nickel, and Le}}}
-\bibcite{liu2022flow}{{6}{2022}{{Liu et~al.}}{{Liu, Gong, and Liu}}}
-\bibcite{perez2018film}{{7}{2018}{{Perez et~al.}}{{Perez, Strub, de~Vries, Dumoulin, and Courville}}}
-\bibcite{yim2023fast}{{8}{2023}{{Yim et~al.}}{{Yim, Campbell, Foong, Gastegger, Jim{\'e}nez-Luna, Lewis, Satorras, Veeling, Barzilay, Jaakkola, et~al.}}}
+\bibcite{anand2025rna}{{1}{2025}{{Anand et~al.}}{{Anand, Joshi, Morehead, Jamasb, Harris, Mathis, Didi, Ying, Hooi, and Li{\`o}}}}
+\bibcite{bose2023se}{{2}{2023}{{Bose et~al.}}{{Bose, Akhound-Sadegh, Huguet, Fatras, Rector-Brooks, Liu, Nica, Korablyov, Bronstein, and Tong}}}
+\bibcite{leach2022denoising}{{3}{2022}{{Leach et~al.}}{{Leach, Schmon, Degiacomi, and Willcocks}}}
+\bibcite{lipman2022flow}{{4}{2022}{{Lipman et~al.}}{{Lipman, Chen, Ben-Hamu, Nickel, and Le}}}
+\bibcite{liu2022flow}{{5}{2022}{{Liu et~al.}}{{Liu, Gong, and Liu}}}
+\bibcite{tong2024improving}{{6}{2024}{{Tong et~al.}}{{Tong, Malkin, Huguet, Zhang, Rector-Brooks, Fatras, Wolf, and Bengio}}}
+\bibcite{yim2023fast}{{7}{2023{a}}{{Yim et~al.}}{{Yim, Campbell, Foong, Gastegger, Jim{\'e}nez-Luna, Lewis, Satorras, Veeling, Barzilay, Jaakkola, et~al.}}}
+\bibcite{yim2023se}{{8}{2023{b}}{{Yim et~al.}}{{Yim, Trippe, De~Bortoli, Mathieu, Doucet, Barzilay, and Jaakkola}}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Margins in \LaTeX  {}}{8}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Pseudocode}{8}{appendix.A}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {B}Technical appendices and supplementary material}{8}{appendix.B}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces \textbf  {The three levels of ResBridge, aligned row by row.} A single three-line table; each row corresponds to one conceptual operation, so identical lines line up horizontally and a level that does not contain a given operation simply leaves its cell blank. \textcolor {blue!70!black}{Blue} marks every line (or sub-expression) that Level~2 introduces on top of Level~1 (the heteroscedastic stochastic bridge); \textcolor {red!70!black}{red} marks every line (or sub-expression) that Level~3 introduces on top of Level~2 (the B-factor anchor). Both colors persist across columns so that the layering remains visible at a glance. \emph  {Notation.} $f_\theta $: drift FlowModel, returning the predicted clean state $\hat  {G}_1$ and (in Level~2/3) its single/pair embeddings $\mathbf  {c}$; $g_\phi $: BridgeWidthNet, returning a per-residue bounded modulation $\alpha \in [\alpha _{\min },\alpha _{\max }]$; $\sigma _0(t)=\lambda \sqrt  {t(1{-}t)}$: endpoint-safe base schedule; $\sigma $: per-residue bridge width; $\mathrm  {sg}(\cdot )$: stop-gradient, decoupling drift gradients from $g_\phi $; $\mathrm  {norm}_{+}$: log-shift-scale positive normalization of B-factors. The drift parameters $\theta $ and the bridge parameters $\phi $ are updated by \emph  {separate} optimizers, which is what keeps the bridge purely an ``observer'' of the drift.}}{9}{figure.3}\protected@file@percent }
 \newlabel{fig:algorithms}{{3}{9}{\textbf {The three levels of ResBridge, aligned row by row.} A single three-line table; each row corresponds to one conceptual operation, so identical lines line up horizontally and a level that does not contain a given operation simply leaves its cell blank. \textcolor {blue!70!black}{Blue} marks every line (or sub-expression) that Level~2 introduces on top of Level~1 (the heteroscedastic stochastic bridge); \textcolor {red!70!black}{red} marks every line (or sub-expression) that Level~3 introduces on top of Level~2 (the B-factor anchor). Both colors persist across columns so that the layering remains visible at a glance. \emph {Notation.} $f_\theta $: drift FlowModel, returning the predicted clean state $\hat {G}_1$ and (in Level~2/3) its single/pair embeddings $\mathbf {c}$; $g_\phi $: BridgeWidthNet, returning a per-residue bounded modulation $\alpha \in [\alpha _{\min },\alpha _{\max }]$; $\sigma _0(t)=\lambda \sqrt {t(1{-}t)}$: endpoint-safe base schedule; $\sigma $: per-residue bridge width; $\mathrm {sg}(\cdot )$: stop-gradient, decoupling drift gradients from $g_\phi $; $\mathrm {norm}_{+}$: log-shift-scale positive normalization of B-factors. The drift parameters $\theta $ and the bridge parameters $\phi $ are updated by \emph {separate} optimizers, which is what keeps the bridge purely an ``observer'' of the drift}{figure.3}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {A}Pseudocode}{9}{appendix.A}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {B}Technical appendices and supplementary material}{9}{appendix.B}\protected@file@percent }
-\gdef \@abspage@last{17}
+\gdef \@abspage@last{16}

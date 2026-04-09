@@ -85,7 +85,7 @@ experiment:
     dirpath: /projects/u6bk/wanli/ckpt_flow/${experiment.wandb.project}/${experiment.wandb.name}/
 
 stochastic_bridge:
-  level: 2                    # 1=deterministic flow, 2=SE(3) stochastic bridge, 3=bridge + B-factor
+  level: 3                    # 1=deterministic flow, 2=SE(3) stochastic bridge, 3=bridge + B-factor
   bridge:
     # Fixed, global bridge widths in raw physical units.
     # Chosen so that the BB std at t=0.5 (= sigma/2) matches the typical Level 1

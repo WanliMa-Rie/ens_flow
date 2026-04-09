@@ -17,7 +17,7 @@ import modal
 
 from modal_app.image import image
 
-app = modal.App("ens-flow")
+app = modal.App("se3-bridge-b")
 
 data_vol = modal.Volume.from_name("ens-flow-data", create_if_missing=True)
 ckpt_vol = modal.Volume.from_name("ens-flow-ckpt", create_if_missing=True)

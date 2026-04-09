@@ -5,15 +5,6 @@
   \providecommand{\doi}[1]{doi: #1}\else
   \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
 
-\bibitem[Abramson et~al.(2024)Abramson, Adler, Dunger, Evans, Green, Pritzel,
-  Ronneberger, Willmore, Ballard, Bambrick, et~al.]{abramson2024af3}
-Josh Abramson, Jonas Adler, Jack Dunger, Richard Evans, Tim Green, Alexander
-  Pritzel, Olaf Ronneberger, Lindsay Willmore, Andrew~J Ballard, Joshua
-  Bambrick, et~al.
-\newblock Accurate structure prediction of biomolecular interactions with
-  {A}lpha{F}old~3.
-\newblock \emph{Nature}, 630:\penalty0 493--500, 2024.
-
 \bibitem[Anand et~al.(2025)Anand, Joshi, Morehead, Jamasb, Harris, Mathis,
   Didi, Ying, Hooi, and Li{\`o}]{anand2025rna}
 Rishabh Anand, Chaitanya~K Joshi, Alex Morehead, Arian~R Jamasb, Charles
@@ -30,11 +21,13 @@ Avishek~Joey Bose, Tara Akhound-Sadegh, Guillaume Huguet, Kilian Fatras, Jarrid
 \newblock Se (3)-stochastic flow matching for protein backbone generation.
 \newblock \emph{arXiv preprint arXiv:2310.02391}, 2023.
 
-\bibitem[Kendall and Gal(2017)]{kendall2017uncertainties}
-Alex Kendall and Yarin Gal.
-\newblock What uncertainties do we need in {B}ayesian deep learning for
-  computer vision?
-\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+\bibitem[Leach et~al.(2022)Leach, Schmon, Degiacomi, and
+  Willcocks]{leach2022denoising}
+Adam Leach, Sebastian~M Schmon, Matteo~T Degiacomi, and Chris~G Willcocks.
+\newblock Denoising diffusion probabilistic models on {SO}(3) for rotational
+  alignment.
+\newblock \emph{ICLR Workshop on Geometrical and Topological Representation
+  Learning}, 2022.
 
 \bibitem[Lipman et~al.(2022)Lipman, Chen, Ben-Hamu, Nickel, and
   Le]{lipman2022flow}
@@ -48,19 +41,30 @@ Xingchao Liu, Chengyue Gong, and Qiang Liu.
   rectified flow.
 \newblock \emph{arXiv preprint arXiv:2209.03003}, 2022.
 
-\bibitem[Perez et~al.(2018)Perez, Strub, de~Vries, Dumoulin, and
-  Courville]{perez2018film}
-Ethan Perez, Florian Strub, Harm de~Vries, Vincent Dumoulin, and Aaron
-  Courville.
-\newblock {FiLM}: Visual reasoning with a general conditioning layer.
-\newblock In \emph{AAAI Conference on Artificial Intelligence}, 2018.
+\bibitem[Tong et~al.(2024)Tong, Malkin, Huguet, Zhang, Rector-Brooks, Fatras,
+  Wolf, and Bengio]{tong2024improving}
+Alexander Tong, Nikolay Malkin, Guillaume Huguet, Yanlei Zhang, Jarrid
+  Rector-Brooks, Kilian Fatras, Guy Wolf, and Yoshua Bengio.
+\newblock Improving and generalizing flow-based generative models with
+  minibatch optimal transport.
+\newblock In \emph{Transactions on Machine Learning Research}, 2024.
 
-\bibitem[Yim et~al.(2023)Yim, Campbell, Foong, Gastegger, Jim{\'e}nez-Luna,
-  Lewis, Satorras, Veeling, Barzilay, Jaakkola, et~al.]{yim2023fast}
+\bibitem[Yim et~al.(2023{\natexlab{a}})Yim, Campbell, Foong, Gastegger,
+  Jim{\'e}nez-Luna, Lewis, Satorras, Veeling, Barzilay, Jaakkola,
+  et~al.]{yim2023fast}
 Jason Yim, Andrew Campbell, Andrew~YK Foong, Michael Gastegger, Jos{\'e}
   Jim{\'e}nez-Luna, Sarah Lewis, Victor~Garcia Satorras, Bastiaan~S Veeling,
   Regina Barzilay, Tommi Jaakkola, et~al.
 \newblock Fast protein backbone generation with se (3) flow matching.
-\newblock \emph{arXiv preprint arXiv:2310.05297}, 2023.
+\newblock \emph{arXiv preprint arXiv:2310.05297}, 2023{\natexlab{a}}.
+
+\bibitem[Yim et~al.(2023{\natexlab{b}})Yim, Trippe, De~Bortoli, Mathieu,
+  Doucet, Barzilay, and Jaakkola]{yim2023se}
+Jason Yim, Brian~L Trippe, Valentin De~Bortoli, Emile Mathieu, Arnaud Doucet,
+  Regina Barzilay, and Tommi Jaakkola.
+\newblock {SE}(3) diffusion model with application to protein backbone
+  generation.
+\newblock In \emph{International Conference on Machine Learning (ICML)},
+  2023{\natexlab{b}}.
 
 \end{thebibliography}

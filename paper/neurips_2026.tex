@@ -1,4 +1,9 @@
 \documentclass{article}
+% chktex-file 3
+% chktex-file 36
+% chktex-file 24
+% chktex-file 13
+% chktex-file 12
 
 % if you need to pass options to natbib, use, e.g.:
 %     \PassOptionsToPackage{numbers, compress}{natbib}
@@ -60,7 +65,7 @@
 \usepackage{amsmath}
 \usepackage{array}          % extended column specifiers (raggedright p-columns)
 \usepackage{tikz}           % vector graphics for framework figure
-\usetikzlibrary{positioning, arrows.meta, calc, fit, backgrounds}
+\usetikzlibrary{positioning, arrows.meta, calc, fit, backgrounds, decorations.pathmorphing}
 % --- Colorvania (cv*) palette for the framework figure ---
 \definecolor{cvaccent}{HTML}{A23B2A}
 \definecolor{cvsubtle}{HTML}{243B5A}
@@ -179,192 +184,187 @@ with $\lambda_x,\lambda_R>0$ balancing the two modalities and $\|\cdot\|_{\mathr
 
 
 
-\subsection{ResBridge}\label{sec:resbridge}
+\subsection{ResBridge: a tangent-space-lifted stochastic bridge}\label{sec:resbridge}
 
 \begin{figure}[t]
 \centering
-\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
-    module/.style={rounded corners=4pt, minimum height=0.9cm, minimum width=1.8cm,
-        align=center, font=\scriptsize, draw, line width=0.55pt, fill=white},
-    detail/.style={rounded corners=3pt, minimum height=0.55cm, minimum width=1.8cm,
-        align=center, font=\tiny, fill=white, draw=cvneutral!40, line width=0.4pt, dashed},
-    ext/.style={rounded corners=3pt, minimum height=0.55cm, minimum width=1.35cm,
-        align=center, font=\tiny, fill=white, draw, line width=0.45pt},
-    hand/.style={circle, minimum size=0.72cm,
-        align=center, font=\scriptsize, draw, line width=0.6pt, fill=white},
-    arr/.style={-{Stealth[length=5pt]}, line width=0.65pt},
-    darr/.style={-{Stealth[length=4pt]}, line width=0.55pt, dashed},
-    lbl/.style={font=\tiny, text=cvneutral},
+    >={Stealth[length=6pt]},
+    line width=0.75pt,
+    font=\small,
+    box/.style={rounded corners=6pt, draw, line width=0.85pt, align=center},
+    channel/.style={box, fill=cvaccentsoft!55, draw=cvaccent,
+        minimum width=6.4cm, minimum height=2.65cm},
+    drift/.style={box, fill=cvsubtlesoft!55, draw=cvsubtle,
+        minimum width=8.8cm, minimum height=1.35cm},
+    sde/.style={box, fill=cvsubtlesoft!28, draw=cvsubtle,
+        minimum width=12.8cm, minimum height=1.35cm},
+    iolab/.style={font=\footnotesize, text=cvneutral, align=center},
+    chtitle/.style={font=\footnotesize\bfseries, text=cvaccent},
+    drtitle/.style={font=\footnotesize\bfseries, text=cvsubtle},
+    note/.style={font=\scriptsize\itshape, text=cvneutral},
+    arr/.style={->, line width=0.85pt, draw=cvneutral},
 ]
 
-% ===== Stage backgrounds =====
-\begin{scope}[on background layer]
-  \fill[cvsubtlesoft!35, rounded corners=8pt] (-0.3,-1.9) rectangle (5.9,3.3);
-  \fill[cvaccentsoft!30, rounded corners=8pt] (6.2,-1.9) rectangle (13.0,3.3);
-  \fill[cvsubtlesoft!18!cvaccentsoft!18, rounded corners=8pt] (13.3,-1.9) rectangle (20.4,3.3);
-\end{scope}
+% ===== Inputs (top) =====
+\node[iolab] (in) at (0, 4.45)
+  {\textbf{Endpoints} (training pair) \,/\, prior sample (inference) \quad
+   $G_0=(x_0,R_0)\sim p_0,\;\; G_1=(x_1,R_1)\sim p_{\mathrm{data}}(\,\cdot\mid s)$};
 
-% ===== Stage labels with key quantities =====
-\node[font=\footnotesize\bfseries, cvsubtle] at (2.8, 2.8)
-  {Stage I\enskip Sequence Encoding};
-\node[font=\tiny, cvsubtle!80] at (2.8, 2.3)
-  {$\mathbf{c}=(\mathbf{c}^{(s)}\!\in\!\mathbb{R}^{L\times 384},\;\mathbf{c}^{(p)}\!\in\!\mathbb{R}^{L\times L\times 128})$};
+% ===== Two channels (the only thing that changes vs L1) =====
+\node[channel] (trans) at (-3.6, 2.0) {};
+\node[chtitle, anchor=north] at ([yshift=-3pt]trans.north)
+  {Translation channel\,\textbar\,$\mathbb{R}^{3}$};
+\node[font=\small, anchor=center, align=center] at ([yshift=2pt]trans.center)
+  {Standard Brownian bridge\\[3pt]
+   $x_t=(1-t)\,x_0+t\,x_1+\sigma_x\sqrt{t(1-t)}\,\varepsilon^{x}$};
+\node[note, anchor=south] at ([yshift=4pt]trans.south)
+  {post-multiply re-center across $\mathcal{R}$};
 
-\node[font=\footnotesize\bfseries, cvaccent] at (9.6, 2.8)
-  {Stage II\enskip Heteroscedastic Bridge};
-\node[font=\tiny, cvaccent!80] at (9.6, 2.3)
-  {$\hat{G}_1=f_\theta(G_t,\mathbf{c},t)\,;\;\;\sigma=\sigma_0(t)\!\cdot\!g_\phi(\mathbf{c},\Delta x,\Delta\omega,t)$};
+\node[channel] (rot) at (3.6, 2.0) {};
+\node[chtitle, anchor=north] at ([yshift=-3pt]rot.north)
+  {Rotation channel\,\textbar\,tangent-space lift};
+\node[font=\small, anchor=center, align=center] at ([yshift=4pt]rot.center)
+  {$\omega=\log(R_0^{\!\top}R_1)^{\!\vee}\!\in\!\mathfrak{so}(3)$\\[3pt]
+   $\Omega_t=t\,\omega+\sigma_R\sqrt{t(1-t)}\,\varepsilon^{R}$\\[3pt]
+   $R_t=R_0\,\exp\!\bigl(\widehat{\Omega_t}\bigr)\in SO(3)$};
+\node[note, anchor=south] at ([yshift=4pt]rot.south)
+  {chart-induced \,\textbar\, wrapped Gaussian on geodesic};
 
-\node[font=\footnotesize\bfseries, cvsubtle!50!cvaccent] at (16.85, 2.8)
-  {Stage III\enskip Stochastic Sampling};
-\node[font=\tiny, cvsubtle!50!cvaccent] at (16.85, 2.3)
-  {$\{G_1^{(k)}\}_{k=1}^{K}\sim p_{\theta,\phi}(\,\cdot\mid s)$};
+\draw[arr] (in.south -| trans.north) -- (trans.north);
+\draw[arr] (in.south -| rot.north) -- (rot.north);
 
-% ===== STAGE I: Sequence Encoding =====
-\node[detail, draw=cvsubtle!40, fill=cvsubtlesoft!5, minimum width=3.6cm] (l1) at (2.8, 1.55)
-  {Pretrained, frozen biomolecular encoder};
+% ===== Merge =====
+\node[font=\small] (gt) at (0, -0.15)
+  {$G_t=(x_t,R_t)\;\in\;SE(3)^{L}$};
+\draw[arr, draw=cvaccent!75] (trans.south) -- (gt.north -| trans.south);
+\draw[arr, draw=cvaccent!75] (rot.south)   -- (gt.north -| rot.south);
 
-\node[module, draw=cvsubtle, fill=cvsubtlesoft!12, minimum width=2.4cm] (af3) at (2.8, 0)
-  {AlphaFold3\\Pairformer};
+% ===== Drift network (reused unchanged from L1) =====
+\node[drift] (drift) at (0, -1.75) {};
+\node[drtitle, anchor=north] at ([yshift=-3pt]drift.north)
+  {Drift network $v_\theta$ (IPA FlowModel)\;---\;\emph{reused unchanged from \S\ref{sec:se3-fm}}};
+\node[font=\small, anchor=center] at ([yshift=2pt]drift.center)
+  {$\hat{v}^{x}_{t}=(\hat{x}_{1}-x_{t})/(1{-}t)$,\quad
+   $\hat{v}^{R}_{t}=\log\!\bigl(R_{t}^{\!\top}\hat{R}_{1}\bigr)^{\!\vee}\!/(1{-}t)$};
+\draw[arr] (gt.south) -- (drift.north);
 
-\draw[darr, cvsubtle!40] (l1) -- (af3);
+% ===== Loss tag (left of drift) =====
+\node[font=\scriptsize, text=cvsubtle, anchor=east]
+  at ($(drift.west)+(-0.15,0)$)
+  {\eqref{eq:fm-loss}};
 
-\node[ext, draw=cvsubtle, fill=cvsubtlesoft!8] (seq) at (2.8, -1.2)
-  {RNA Sequence $s$};
-\draw[arr, cvsubtle] (seq) -- (af3);
+% ===== Euler-Maruyama step =====
+\node[sde] (em) at (0, -3.65) {};
+\node[drtitle, anchor=north] at ([yshift=-3pt]em.north)
+  {Euler--Maruyama step on $SE(3)^{L}$\;---\;\eqref{eq:bridge-em}};
+\node[font=\small, anchor=center] at ([yshift=2pt]em.center)
+  {$x_{t+\Delta t}=x_t+\hat{v}^{x}_{t}\Delta t+\sigma_x\sqrt{\Delta t}\,\xi^{x}$,\quad
+   $R_{t+\Delta t}=R_t\exp\!\Bigl(\widehat{\hat{v}^{R}_{t}\Delta t+\sigma_R\sqrt{\Delta t}\,\xi^{R}}\Bigr)$};
+\draw[arr] (drift.south) -- (em.north);
 
-% ===== Handoff: c =====
-\node[hand, draw=cvaccent!70] (handI) at (6.05, 0) {$\mathbf{c}$};
-\draw[arr, cvsubtle] (af3.east) -- (handI.west);
+% ===== Containment annotation =====
+\node[note, text=cvaccent!85, anchor=west, align=left]
+  at ($(em.east)+(0.05,0.55)$)
+  {\hphantom{x}};
+\node[note, text=cvaccent!90, anchor=south west, align=left]
+  at ($(em.south west)+(0.0,-0.85)$)
+  {strict containment:\;
+   $\sigma_x{=}\sigma_R{=}0\;\Rightarrow\;$ ODE Euler of \S\ref{sec:se3-fm}\,$\;\Rightarrow\;$ Level\,1};
 
-% ===== STAGE II: Heteroscedastic Bridge =====
-\node[detail, draw=cvaccent!40, fill=cvaccentsoft!6, minimum width=6.0cm] (l2) at (9.6, 1.55)
-  {$\mathcal{L}_{\mathrm{SE(3)}}(\theta)\;\oplus\;\mathcal{L}_{\mathrm{NLL}}(\phi)$\enskip(decoupled by stop-gradient)};
+% ===== Ensemble output =====
+\node[iolab, anchor=north east] (out) at ($(em.south east)+(0,-0.85)$)
+  {iterate $T$ steps $\times$ $K$ initial $G_0$\;
+   $\Longrightarrow$\; ensemble $\{G_1^{(k)}\}_{k=1}^{K}$};
 
-\node[module, draw=cvaccent, fill=cvaccentsoft!18, minimum width=1.9cm] (drift) at (8.0, 0)
-  {Drift $f_\theta$\\IPA FlowModel};
-\node[module, draw=cvaccent, fill=cvaccentsoft!18, minimum width=2.5cm] (bw) at (11.1, 0)
-  {Bridge Width $g_\phi$\\ResConv1D\,+\,FiLM};
-
-\draw[arr, cvaccent] (handI.east) -- (drift.west);
-\draw[darr, cvaccent] (drift.east) -- (bw.west)
-  node[midway, above, font=\tiny, text=cvaccent!80] {$\mathrm{sg}(\hat{G}_1)$};
-\draw[darr, cvaccent!40] (l2) -- (drift);
-\draw[darr, cvaccent!40] (l2) -- (bw);
-
-% Inputs
-\node[ext, draw=cvaccent, fill=cvaccentsoft!8] (gt) at (8.0, -1.2)
-  {$G_t,\,t$};
-\node[ext, draw=cvneutral, fill=black!3] (bf) at (11.1, -1.2)
-  {B-factor $\tilde{B}$};
-\draw[arr, cvaccent] (gt) -- (drift);
-\draw[darr, cvneutral] (bf) -- (bw) node[midway, right, lbl] {L3};
-
-% ===== Handoff: (v_t, σ) =====
-\node[hand, minimum size=0.85cm, draw=cvaccent!50!cvsubtle, font=\tiny] (handII) at (13.15, 0)
-  {$v_t,\sigma$};
-\draw[arr, cvaccent] (bw.east) -- (handII.west);
-
-% ===== STAGE III: Stochastic Sampling =====
-\node[detail, draw=cvsubtle!30!cvaccent!30, fill=cvsubtlesoft!4!cvaccentsoft!4, minimum width=5.8cm] (l3) at (16.85, 1.55)
-  {SDE step\,: $G_{k+1}=G_k+v_t\,\Delta t+\sigma\sqrt{\Delta t}\,\xi$};
-
-\node[module, draw=cvsubtle!70!cvaccent, fill=cvsubtlesoft!8!cvaccentsoft!8, minimum width=2.0cm] (em) at (15.5, 0)
-  {Euler--Maruyama\\step on $SE(3)^L$};
-\node[module, draw=cvsubtle, fill=cvsubtlesoft!10, minimum width=2.0cm] (ens) at (18.2, 0)
-  {Ensemble\\$\{G_1^{(k)}\}_{k=1}^{K}$};
-
-\draw[arr, cvsubtle] (handII.east) -- (em.west);
-\draw[arr, cvsubtle!70!cvaccent] (em.east) -- (ens.west)
-  node[midway, above, lbl] {$T$ steps};
-\draw[darr, cvsubtle!30!cvaccent!30] (l3) -- (em);
-\draw[darr, cvsubtle!30!cvaccent!30] (l3) -- (ens);
-
-% Input
-\node[ext, draw=cvneutral, fill=black!3] (g0) at (15.5, -1.2)
-  {$G_0\sim p_0$};
-\draw[arr, cvneutral] (g0) -- (em);
-
-\end{tikzpicture}%
-}
-\caption{\textbf{ResBridge framework.}
-\textbf{Stage~I.} An RNA sequence $s$ is encoded once by a frozen AlphaFold3 Pairformer~\cite{abramson2024af3} into a single representation $\mathbf{c}^{(s)}\!\in\!\mathbb{R}^{L\times 384}$ and a pair representation $\mathbf{c}^{(p)}\!\in\!\mathbb{R}^{L\times L\times 128}$, jointly written $\mathbf{c}$.
-\textbf{Stage~II.} The deterministic drift $f_\theta$ of \S\ref{sec:se3-fm} consumes $(G_t,\mathbf{c},t)$ and predicts the clean state $\hat{G}_1$, supervised by the SE(3) regression loss \eqref{eq:fm-loss}. The bridge width network $g_\phi$ reuses the same $\mathbf{c}$ and the geometric residuals \eqref{eq:geom-residual} computed from \emph{stop-gradient} $\hat{G}_1$, and emits per-residue bounded modulations $\alpha^{m}_i\!\in\![\alpha_{\min},\alpha_{\max}]$ that scale the endpoint-safe base schedule into $\sigma^{m}_{i,t}=\sigma_{0}^{m}(t)\!\cdot\!\alpha^{m}_{i}$, trained by the heteroscedastic NLL \eqref{eq:bridge-nll}. The dashed \textsf{sg} arrow is the architectural \emph{stop-gradient firewall} that decouples the two losses: gradients of $\mathcal{L}_{\mathrm{NLL}}$ never reach $\theta$, so $f_\theta$ converges to the same vector field as in the deterministic SE(3) flow matching backbone. The optional B-factor anchor (Level~3, \S\ref{sec:resbridge-guided}) supplies an experimental flexibility prior on $\sigma$.
-\textbf{Stage~III.} The drift velocity $v_t$ and the bridge width $\sigma$ enter a single Euler--Maruyama step on $SE(3)^L$ \eqref{eq:bridge-em}; iterating $T$ steps from independent $G_0\!\sim\!p_0$ produces a conformational ensemble $\{G_1^{(k)}\}_{k=1}^{K}$.}
+\end{tikzpicture}
+\caption{\textbf{ResBridge framework (Level~2).}
+ResBridge replaces the deterministic conditional path of \S\ref{sec:se3-fm} with two closed-form Brownian bridges (red), one in $\mathbb{R}^{3}$ for translations and one in the tangent space $\mathfrak{so}(3)\!\cong\!\mathbb{R}^{3}$ for rotations, the latter pushed back to $SO(3)$ through the exponential map at $R_{0}$. The corrupted state $G_{t}=(x_{t},R_{t})$ is fed into the same drift network $v_{\theta}$ (blue) as in the deterministic backbone of \S\ref{sec:se3-fm}, supervised by the same flow matching loss \eqref{eq:fm-loss}; the only inference change is to replace the ODE Euler step by the Euler--Maruyama step \eqref{eq:bridge-em}. ResBridge therefore introduces \emph{no new trainable parameter and no new loss term}, and strictly contains the deterministic backbone in the limit $\sigma_{x}{=}\sigma_{R}{=}0$.}
 \label{fig:framework}
 \end{figure}
 
-The deterministic SE(3) flow matching backbone of \S\ref{sec:se3-fm} learns a velocity field that, given any starting frame configuration $G_0\!\sim\!p_0$, integrates to a single endpoint via an ODE. Under multi-modal data this leaves the model two routes to under-coverage of $p_{\mathrm{data}}(\,\cdot\mid s)$: (i) the velocity field, trained by an $L_2$ regression onto a deterministic conditional path, can be biased toward the conditional mean whenever multiple ground-truth endpoints are consistent with the same $(G_t,s)$; and (ii) the noise-free sampler offers no second mechanism to disperse trajectories across distinct basins once one has been committed to. We address both routes simultaneously by wrapping the deterministic drift with a per-residue heteroscedastic noise process whose width is itself learned from the drift's own residuals, turning the ODE of \S\ref{sec:se3-fm} into an SDE that we call \textbf{ResBridge}.
+The deterministic SE(3) flow matching backbone of \S\ref{sec:se3-fm} transports each starting frame configuration $G_0\!\sim\!p_0$ to a single endpoint via an ODE. Under multi-modal data this commits the velocity field to the conditional mean whenever several ground-truth endpoints are consistent with the same $(G_t,s)$, and the noise-free sampler offers no second mechanism to disperse trajectories across distinct basins once one has been committed to. \textbf{ResBridge} addresses both routes by replacing the deterministic conditional path of \S\ref{sec:se3-fm} with a \emph{stochastic bridge} on $SE(3)^L$ that is closed-form, endpoint-strict, and admits an analytically tractable drift, while leaving the loss, the network, and the velocity target of \S\ref{sec:se3-fm} entirely unchanged.
 
-\paragraph{Stochastic bridge on $SE(3)^L$.}
-Let $f_\theta$ denote the drift model trained by \eqref{eq:fm-loss}, and write $\hat{G}_1=(\hat{x}_1,\hat{R}_1)=f_\theta(G_t,s,t)$ for the clean state implied by its prediction at $(G_t,s,t)$, with corresponding velocities $\hat{v}^{x}_{t}=(\hat{x}_{1}-x_{t})/(1{-}t)$ and $\hat{v}^{R}_{t}=\log(R_{t}^{\!\top}\hat{R}_{1})/(1{-}t)$. ResBridge integrates the SDE
+\paragraph{Three properties.}
+We need a conditional distribution $p_t(G_t\!\mid\!G_0,G_1)$ that satisfies:
+(i) \emph{closed-form sampling}, so that training remains simulation-free;
+(ii) \emph{strict endpoint constraints}, $G_{t=0}\!=\!G_0$ and $G_{t=1}\!=\!G_1$ almost surely;
+(iii) \emph{analytic drift}, so that the conditional flow matching loss of \S\ref{sec:se3-fm} can supervise the same velocity field on the same network.
+Translations are easy --- the standard Euclidean Brownian bridge supplies all three. Rotations are not: the intrinsic Brownian bridge on $SO(3)$ generated by the Laplace--Beltrami operator has no closed-form simulator, since its transition density is the heat kernel and is only available as a series of Wigner $D$-functions, which is what motivates the truncated IGSO(3) approximations used by prior $SO(3)$ diffusion models~\cite{leach2022denoising,yim2023se}. We sidestep this difficulty by \emph{lifting the bridge to the tangent space at $R_0$ and pushing forward through the exponential map}.
+
+\paragraph{Tangent-space-lifted bridge on $SE(3)^L$.}
+Per residue $i$, ResBridge defines the conditional sample $G_{i,t}=(x_{i,t},R_{i,t})$ by two independent Brownian bridges, one in $\mathbb{R}^3$ and one in $\mathfrak{so}(3)\!\cong\!\mathbb{R}^3$. The translation channel is the Euclidean bridge
 \begin{equation}
-\mathrm{d}x_{i,t}\;=\;\hat{v}^{x}_{i,t}\,\mathrm{d}t \,+\, \sigma^{x}_{i,t}\,\mathrm{d}W^{x}_{t},
-\qquad
-\mathrm{d}R_{i,t}\;=\;R_{i,t}\!\cdot\!\bigl(\,\hat{v}^{R}_{i,t}\,\mathrm{d}t \,+\, \sigma^{R}_{i,t}\,\mathrm{d}B^{R}_{t}\,\bigr),
-\label{eq:bridge-sde}
+x_{i,t}\;=\;(1-t)\,x_{i,0}+t\,x_{i,1}+\sigma_x\sqrt{t(1-t)}\,\varepsilon^{x}_i,
+\qquad \varepsilon^{x}_i\sim\mathcal{N}(0,I_3),
+\label{eq:trans-bridge}
 \end{equation}
-where $W^{x}_{t}$ is a standard 3-dimensional Brownian motion in $\mathbb{R}^3$ and $B^{R}_{t}$ is the right-invariant Brownian motion on $SO(3)$ identified with $\mathbb{R}^3$ via $\mathfrak{so}(3)\cong\mathbb{R}^3$. Discretizing \eqref{eq:bridge-sde} by Euler--Maruyama yields the ResBridge sampling step
+with constant width $\sigma_x>0$ and closed-form marginal $x_{i,t}\!\mid\!x_{i,0},x_{i,1}\sim\mathcal{N}\!\bigl((1-t)x_{i,0}+t\,x_{i,1},\,\sigma_x^2\,t(1-t)\,I_3\bigr)$. The rotation channel takes the relative rotation $R_{i,0}\!\to\!R_{i,1}$ in the principal log
 \begin{equation}
-x_{i,t+\Delta t}\;=\;x_{i,t}+\hat{v}^{x}_{i,t}\,\Delta t \,+\, \sigma^{x}_{i,t}\sqrt{\Delta t}\,\xi_i,
+\omega_i\;=\;\log\!\bigl(R_{i,0}^{\!\top}R_{i,1}\bigr)^{\!\vee}\;\in\;\mathbb{R}^{3}\;\cong\;\mathfrak{so}(3),
+\qquad |\omega_i|<\pi,
+\label{eq:rel-omega}
+\end{equation}
+runs an Euclidean Brownian bridge on $\omega_i$ with constant width $\sigma_R>0$,
+\begin{equation}
+\Omega_{i,t}\;=\;t\,\omega_i+\sigma_R\sqrt{t(1-t)}\,\varepsilon^{R}_i,
+\qquad \varepsilon^{R}_i\sim\mathcal{N}(0,I_3),
+\label{eq:tangent-bridge}
+\end{equation}
+and pushes forward to $SO(3)$ via the right action of the exponential map at $R_{i,0}$,
+\begin{equation}
+R_{i,t}\;=\;R_{i,0}\,\exp\!\bigl(\,\widehat{\Omega_{i,t}}\,\bigr).
+\label{eq:rot-bridge}
+\end{equation}
+The pair \eqref{eq:trans-bridge}--\eqref{eq:rot-bridge} defines the ResBridge conditional distribution on $SE(3)^L$, parameterized by two constant scalar widths: $\sigma_x$ in {\AA} and $\sigma_R$ in radians.
+
+\paragraph{Honest framing.}
+Because \eqref{eq:tangent-bridge} is a Gaussian in a chart anchored at $R_{i,0}$, the resulting marginal $p_t(R_{i,t}\!\mid\!R_{i,0},R_{i,1})$ is a \emph{wrapped Gaussian around the geodesic}, not the heat kernel of $SO(3)$; a different choice of base point would give a different conditional law. ResBridge is therefore a \textbf{chart-induced} stochastic bridge rather than an intrinsic Brownian bridge, and we adopt this construction explicitly because it gives Properties (i)--(iii) in closed form. The IGSO(3)-based training prior of \S\ref{sec:se3-fm} keeps $|\omega_i|$ well below the cut locus $\pi$ at every residue and timestep, so the chart artefact never manifests during training; the same holds at inference because the Euler-Maruyama loop only ever exponentiates a small per-step increment, never a full $\omega$. We discuss this trade-off explicitly in the limitations (\S\ref{sec:resbridge-guided}).
+
+\paragraph{Endpoints, conditional law, and drift.}
+The construction \eqref{eq:trans-bridge}--\eqref{eq:rot-bridge} admits the following two propositions, proved in Appendix~A.
+
+\textit{Proposition 1 (Endpoint constraint).} Almost surely, $G_{i,0}=(x_{i,0},R_{i,0})$ and $G_{i,1}=(x_{i,1},R_{i,1})$ for every residue $i$.
+
+\textit{Proposition 2 (Closed-form conditional law).} Conditionally on the endpoints, the per-residue marginals factor and are Gaussians in their respective charts:
+\begin{equation*}
+x_{i,t}\!\mid\!x_{i,0},x_{i,1}\sim\mathcal{N}\!\bigl((1-t)x_{i,0}+t\,x_{i,1},\,\sigma_x^{2}\,t(1-t)\,I_3\bigr),
+\quad
+\Omega_{i,t}\!\mid\!R_{i,0},R_{i,1}\sim\mathcal{N}\!\bigl(t\,\omega_i,\,\sigma_R^{2}\,t(1-t)\,I_3\bigr),
+\end{equation*}
+with $R_{i,t}=R_{i,0}\exp(\widehat{\Omega_{i,t}})$ the pushforward of the tangent-space Gaussian.
+
+A direct consequence of Proposition~2 is that the conditional drift on each modality decouples and is \textbf{identical to the deterministic SE(3) flow matching target of \S\ref{sec:se3-fm}}. Differentiating the bridge SDEs in $\mathbb{R}^3$ and in $\mathfrak{so}(3)$ (Appendix~A) yields
+\begin{equation}
+u^{x}_{i,t}\;=\;\frac{x_{i,1}-x_{i,t}}{1-t},
 \qquad
-R_{i,t+\Delta t}\;=\;R_{i,t}\,\exp\!\bigl(\,\hat{v}^{R}_{i,t}\,\Delta t \,+\, \sigma^{R}_{i,t}\sqrt{\Delta t}\,\zeta_i\,\bigr),
+u^{R}_{i,t}\;=\;\frac{\log\!\bigl(R_{i,t}^{\!\top}R_{i,1}\bigr)^{\!\vee}}{1-t}\;\in\;T_{R_{i,t}}SO(3),
+\label{eq:bridge-target}
+\end{equation}
+which is exactly~\eqref{eq:fm-loss}'s regression target. Conditional flow matching theory~\cite{lipman2022flow,tong2024improving} guarantees that any pair of (legal) conditional sampler and conditional target supervises the corresponding marginal velocity field; ResBridge changes only the sampler in $G_t$, so the loss \eqref{eq:fm-loss}, the network $v_\theta$, and the per-modality weights $\lambda_x,\lambda_R$ are all reused verbatim. \textbf{ResBridge introduces no new trainable parameter and no new loss term.}
+
+\paragraph{Centered translation prior.}
+The flow matching backbone of \S\ref{sec:se3-fm} was trained on translation samples whose batch-residue mean is approximately zero (the OT-aligned prior of~\cite{yim2023fast}). Injecting i.i.d.\ Gaussian noise into~\eqref{eq:trans-bridge} breaks this calibration: the residue-mean of $\eta^{x}_i:=\sigma_x\sqrt{t(1-t)}\,\varepsilon^{x}_i$ is $O(1/\sqrt{m_R})$ rather than zero, where $m_R$ is the number of resolved residues per sample. We restore exact zero-mean translations by \emph{post-multiply re-centering} the noise across resolved residues:
+\begin{equation}
+\tilde\eta^{x}_{i}\;=\;\eta^{x}_{i}\,-\,\frac{1}{m_R}\!\!\sum_{j\in\mathcal{R}}\!\eta^{x}_{j},
+\qquad
+x_{i,t}\;=\;(1-t)x_{i,0}+t\,x_{i,1}+\tilde\eta^{x}_{i},
+\label{eq:trans-recenter}
+\end{equation}
+so that $\sum_{i\in\mathcal{R}}\tilde\eta^{x}_{i}=0$ holds bit-exact for every sample and $v_\theta$ continues to see corrupted batches whose translation distribution matches its training prior. Re-centering is sample-local and preserves the conditional Gaussian structure of \eqref{eq:trans-bridge} up to an $O(1/m_R)$ correction in the per-residue covariance, two orders of magnitude below the experimental B-factor noise floor (Appendix~C). The same construction is applied transparently in \S\ref{sec:resbridge-guided}, where it becomes essential under per-residue heteroscedasticity.
+
+\paragraph{Sampling.}
+At inference we replace the ODE Euler step of \S\ref{sec:se3-fm} by an Euler--Maruyama step on $SE(3)^L$. Given the current state $G_{i,t}$, the network produces a clean prediction $\hat{G}_{i,1}=(\hat{x}_{i,1},\hat{R}_{i,1})$, the corresponding drift velocities $\hat{v}^{x}_{i,t}=(\hat{x}_{i,1}-x_{i,t})/(1-t)$ and $\hat{v}^{R}_{i,t}=\log(R_{i,t}^{\!\top}\hat{R}_{i,1})^{\!\vee}/(1-t)$, and the next state is
+\begin{equation}
+x_{i,t+\Delta t}=x_{i,t}+\hat{v}^{x}_{i,t}\,\Delta t+\sigma_x\sqrt{\Delta t}\,\xi^{x}_i,
+\qquad
+R_{i,t+\Delta t}=R_{i,t}\,\exp\!\Bigl(\,\widehat{\hat{v}^{R}_{i,t}\,\Delta t+\sigma_R\sqrt{\Delta t}\,\xi^{R}_i}\,\Bigr),
 \label{eq:bridge-em}
 \end{equation}
-with $\xi_i,\zeta_i\!\sim\!\mathcal{N}(0,I_3)$ independent across residues and time steps. The right-hand sides recover the deterministic flow-matching update of \S\ref{sec:se3-fm} exactly when $\sigma^{x}_{i,t}=\sigma^{R}_{i,t}=0$, so ResBridge strictly generalizes its backbone.
+with $\xi^{x}_i,\xi^{R}_i\!\sim\!\mathcal{N}(0,I_3)$ independent across residues and timesteps. Iterating $T$ steps from $K$ independent initializations $G_0^{(k)}\!\sim\!p_0$ produces a conformational ensemble $\{G_1^{(k)}\}_{k=1}^{K}$. We use $\sigma_x=2.0$\,{\AA} and $\sigma_R=0.25$\,rad throughout, which match the typical magnitude of the drift residual that the deterministic backbone leaves at $t\!\approx\!0.5$.
 
-We construct the bridge width as a product of two factors,
-\begin{equation}
-\sigma^{m}_{i,t}\;=\;\sigma_{0}^{m}(t)\cdot\alpha^{m}_{i,t},
-\qquad
-\sigma_{0}^{m}(t)\;=\;\lambda_m\sqrt{t(1-t)},
-\qquad m\in\{x,R\},
-\label{eq:bridge-width}
-\end{equation}
-where $\sigma_{0}^{m}(t)$ is a global \emph{endpoint-safe} base schedule and $\alpha^{m}_{i,t}\in[\alpha_{\min},\alpha_{\max}]$ is a per-residue, state-dependent modulation predicted by an auxiliary network $g_\phi$ described below. Three properties of \eqref{eq:bridge-width} together give ResBridge its expressive power. (i) \emph{Endpoint safety}: $\sigma_{0}^{m}(t)$ vanishes at $t\!=\!0$ and $t\!=\!1$, so the SDE collapses back to deterministic transport at both ends and trajectories are guaranteed to land on the data manifold rather than be perturbed off it by terminal noise. (ii) \emph{Per-residue}: each nucleotide carries its own $\sigma$, so the model can spread a flexible loop without perturbing a stable helix elsewhere in the same molecule. (iii) \emph{State-dependence}: $\alpha^{m}_{i,t}$ depends on the current backbone state $G_t$ \emph{and} on the drift's prediction at that state, so the noise can ramp up exactly where the drift is uncertain along the present trajectory; the bound $[\alpha_{\min},\alpha_{\max}]$ then keeps SDE integration numerically stable throughout training and inference.
-
-The drift in \eqref{eq:bridge-sde} is unchanged from \S\ref{sec:se3-fm}: ResBridge does not retrain the drift, it only learns how much noise to inject around it. Any pretrained SE(3) flow matching backbone can therefore be retrofitted simply by attaching $g_\phi$ and replacing the ODE sampler by \eqref{eq:bridge-em}.
-
-\paragraph{Bridge width network.}
-The auxiliary network $g_\phi$ that predicts $\alpha_{i,t}$ --- the \emph{bridge width network} --- takes four kinds of input at every residue $i$: the per-residue context $\mathbf{c}^{(s)}_i$ and the pairwise context $\{\mathbf{c}^{(p)}_{ij}\}_{j=1}^{L}$ already exposed by $f_\theta$ in its forward pass; the geometric residuals
-\begin{equation}
-\Delta x_{i}\;=\;x_{i,t}-\hat{x}_{i,1},\qquad
-\Delta\omega_{i}\;=\;\log\!\bigl(\hat{R}_{i,1}^{\!\top}R_{i,t}\bigr)\in\mathbb{R}^{3},
-\label{eq:geom-residual}
-\end{equation}
-which summarize how far the present state has drifted from $f_\theta$'s clean prediction; and the timestep $t$. The single, geometric, and pair features are linearly projected into a shared hidden representation, fused additively after a mean pool of $\mathbf{c}^{(p)}$ over its second axis, FiLM-conditioned~\cite{perez2018film} on a sinusoidal embedding of $t$, and processed by a stack of residual 1D convolutional blocks; two LayerNorm--linear heads then emit a translational and a rotational pre-activation $u^{x}_i,u^{R}_i$, mapped to bounded modulations by
-\begin{equation}
-\alpha^{m}_{i}\;=\;\alpha_{\min}+(\alpha_{\max}-\alpha_{\min})\,\mathrm{sigmoid}(u^{m}_i),\qquad m\in\{x,R\}.
-\label{eq:alpha-bound}
-\end{equation}
-
-Two design choices in the input set are essential. First, the pair representation $\mathbf{c}^{(p)}$ is the only signal that lets $g_\phi$ tell apart structurally distinct conformers of the \emph{same} sequence: a sequence-only network would be forced to predict identical $\sigma$ profiles for every member of an ensemble, whereas pair features encode the ambient structural context that the drift has resolved at the current trajectory point and so vary across modes. Second, the geometric residuals \eqref{eq:geom-residual} are computed from \emph{detached} drift outputs; together with the stop-gradient that we apply to the residuals appearing in the loss below, this is the architectural manifestation of the principle that $g_\phi$ is purely an \emph{observer} of $f_\theta$ and never sends gradients back into the drift parameters $\theta$.
-
-\paragraph{Heteroscedastic self-regulating NLL.}
-We train $g_\phi$ by placing a Gaussian predictive model on the magnitude of the drift residual,
-\begin{equation}
-r^{x}_{i}\;=\;\bigl\|\,\mathrm{sg}(\hat{x}_{i,1})-x_{i,1}\,\bigr\|_{2},\qquad
-r^{R}_{i}\;=\;\bigl\|\log\bigl(R_{i,1}^{\!\top}\,\mathrm{sg}(\hat{R}_{i,1})\bigr)\bigr\|_{2},
-\label{eq:bridge-residual}
-\end{equation}
-and minimizing the per-residue heteroscedastic negative log-likelihood
-\begin{equation}
-\mathcal{L}_{\mathrm{NLL}}(\phi)\;=\;\mathbb{E}_{t,G_0,G_1}\!\left[\,\frac{1}{L}\sum_{i=1}^{L}\,\sum_{m\in\{x,R\}}\lambda_m\!\left(\frac{(r^{m}_{i})^{2}}{(\sigma^{m}_{i,t})^{2}}+\log(\sigma^{m}_{i,t})^{2}\right)\right],
-\label{eq:bridge-nll}
-\end{equation}
-where $\mathrm{sg}(\cdot)$ is the stop-gradient operator, $G_1=(x_{i,1},R_{i,1})_{i=1}^{L}$ is the data sample, the modality weights $\lambda_x,\lambda_R$ are inherited from \eqref{eq:fm-loss} so that $\sigma$ stays in raw physical units (\AA{} for translation, rad for rotation), and the gradient of \eqref{eq:bridge-nll} flows only into $\phi$.
-
-The choice of \eqref{eq:bridge-nll} is what makes the bridge \emph{self-regulating}. Differentiating with respect to $\sigma^{m}_{i,t}$ and setting the result to zero gives the closed-form per-residue minimizer
-\begin{equation}
-\sigma^{m,\star}_{i,t}\;=\;r^{m}_{i},
-\label{eq:bridge-optimal}
-\end{equation}
-so that the optimal heteroscedastic Gaussian fit assigns each residue a noise standard deviation \emph{equal to the magnitude of its own current drift error}. Two consequences follow that drive the behavior of ResBridge at sampling time. First, on residues where the drift is already accurate ($r^{m}_i$ small), $\sigma^{m}_{i,t}$ is driven down toward zero --- those residues are essentially deterministically transported --- whereas on residues where the drift is uncertain ($r^{m}_i$ large), $\sigma^{m}_{i,t}$ is driven up so that the SDE injects exploratory noise exactly where it is most needed. Second, because $r^{m}_i$ depends on the conformer-specific clean prediction $\hat{G}_1$ and on the pair context $\mathbf{c}^{(p)}$ that distinguishes structural members of the same sequence, the optimum \eqref{eq:bridge-optimal} is itself conformer-specific: a residue that is rigid in one structural family of a given sequence and flexible in another receives different $\sigma$ profiles in the two cases, and the corresponding bridges therefore explore different basins of $p_{\mathrm{data}}(\,\cdot\mid s)$. This is the mechanism by which ResBridge converts a single-mode deterministic flow into a multi-modal ensemble sampler.
-
-\eqref{eq:bridge-nll} also admits a clean Bayesian reading: viewing $f_\theta(G_t,s,t)$ as a frozen point estimate of the unknown clean state $G_1$, $\sigma^{m}_{i,t}$ plays the role of a learned per-residue \emph{posterior standard deviation} of $G_1\mid G_t,s$, calibrated against the empirical residual distribution by the same loss that trains heteroscedastic regression and probabilistic depth networks~\cite{kendall2017uncertainties}. In our setting, however, $\sigma$ is not merely an inference-time uncertainty estimate: it is fed straight back into the SDE \eqref{eq:bridge-sde} as the actual noise injected during sampling, so calibration to the drift residual translates directly into the spread of the generated ensemble.
-
-In implementation, $f_\theta$ and $g_\phi$ share a single forward pass --- $g_\phi$ reuses the $\hat{G}_1$, $\mathbf{c}^{(s)}$, and $\mathbf{c}^{(p)}$ already produced by $f_\theta$ --- but are updated by two separate AdamW optimizers, one for $\theta$ minimizing \eqref{eq:fm-loss} and one for $\phi$ minimizing \eqref{eq:bridge-nll}. The stop-gradient in \eqref{eq:bridge-residual} and the detached residuals in \eqref{eq:geom-residual} together guarantee that the two losses do not interfere: from $\theta$'s perspective the bridge does not exist, so the drift continues to converge to the same vector field as in \S\ref{sec:se3-fm}; from $\phi$'s perspective $\theta$ is a frozen oracle, so calibration of $\sigma$ is a stationary supervised regression problem.
+\paragraph{Strict containment of the deterministic backbone.}
+Setting $\sigma_x=\sigma_R=0$ collapses every Brownian bridge in \eqref{eq:trans-bridge}--\eqref{eq:rot-bridge} onto its mean and turns \eqref{eq:bridge-em} into the deterministic ODE Euler step of \S\ref{sec:se3-fm}. ResBridge therefore \textbf{strictly contains} the SE(3) flow matching backbone, both at training-time corruption and at inference-time integration. As a consequence, any pretrained backbone of the form \eqref{eq:fm-loss} can be retrofitted to ResBridge by changing two scalar widths and a single line of the corruption / sampling loop, without retraining or fine-tuning the drift.
 
 \subsection{ResBridge-guided}\label{sec:resbridge-guided}
 
@@ -404,17 +404,11 @@ The \LaTeX{} style file contains three optional arguments:
 \end{itemize}
 
 
-\paragraph{Preprint option}
-If you wish to post a preprint of your work online, e.g., on arXiv, using the NeurIPS style, please use the \verb+preprint+ option. This will create a nonanonymized version of your work with the text ``Preprint. Work in progress.'' in the footer. This version may be distributed as you see fit, as long as you do not say which conference it was submitted to. Please \textbf{do not} use the \verb+final+ option, which should \textbf{only} be used for papers accepted to NeurIPS.
-
 
 At submission time, please omit the \verb+final+ and \verb+preprint+ options. This will anonymize your submission and add line numbers to aid review. Please do \emph{not} refer to these line numbers in your paper as they will be removed during generation of camera-ready copies.
 
 
 The file \verb+neurips_2026.tex+ may be used as a ``shell'' for writing your paper. All you have to do is replace the author, title, abstract, and text of the paper with your own.
-
-
-The formatting instructions contained in these style files are summarized in Sections \ref{gen_inst}, \ref{headings}, and \ref{others} below.
 
 
 \section{General formatting instructions}
@@ -441,10 +435,6 @@ centered above the corresponding address. The lead author's name is to be listed
 first (left-most), and the co-authors' names (if different address) are set to
 follow. If there is only one co-author, list both author and co-author side by
 side.
-
-
-Please pay special attention to the instructions in Section \ref{others}
-regarding figures, tables, acknowledgments, and references.
 
 \section{Headings: first level}
 \label{headings}
@@ -522,12 +512,6 @@ argument \verb+nonatbib+ when loading the style file:
 \end{verbatim}
 
 
-As submission is double blind, refer to your own published work in the third
-person. That is, use ``In the previous work of Jones et al.\ [4],'' not ``In our
-previous work [4].'' If you cite your other papers that are not widely available
-(e.g., a journal paper under review), use anonymous author names in the
-citation, e.g., an author of the form ``A.\ Anonymous'' and include a copy of the anonymized paper in the supplementary material.
-
 
 \subsection{Footnotes}
 
@@ -603,7 +587,6 @@ This package was used to typeset Table~\ref{sample-table}.
 \end{table}
 
 \subsection{Math}
-Note that display math in bare TeX commands will not create correct line numbers for submission. Please use LaTeX (or AMSTeX) commands for unnumbered display math. (You really shouldn't be using \$\$ anyway; see \url{https://tex.stackexchange.com/questions/503/why-is-preferable-to} and \url{https://tex.stackexchange.com/questions/40492/what-are-the-differences-between-align-equation-and-displaymath} for more information.)
 
 \subsection{Final instructions}
 
@@ -614,10 +597,6 @@ numbered.
 
 
 \section{Preparing PDF files}
-
-
-Please prepare submission files with paper size ``US Letter,'' and not, for
-example, ``A4.''
 
 
 Fonts were the main cause of problems in the past years. Your PDF file must only
@@ -634,12 +613,6 @@ achieve this.
 \item You can check which fonts a PDF files uses.  In Acrobat Reader, select the
   menu Files$>$Document Properties$>$Fonts and select Show All Fonts. You can
   also use the program \verb+pdffonts+ which comes with \verb+xpdf+ and is
-  available out-of-the-box on most Linux machines.
-
-
-\item \verb+xfig+ ``patterned'' shapes are implemented with bitmap fonts.  Use
-  "solid" shapes instead.
-
 
 \item The \verb+\bbold+ package almost always uses bitmap fonts.  You should use
   the equivalent AMS Fonts:
@@ -695,7 +668,7 @@ Do {\bf not} include this section in the anonymized submission, only in the fina
 
 {
 \small
-\nocite{alexander1995template,bower1995genesis,hasselmo1995dynamics}
+
 \bibliographystyle{plainnat}
 \bibliography{neurips_2026}
 }
