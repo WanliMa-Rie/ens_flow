@@ -1,3 +1,4 @@
+import os
 import torch, copy
 from rna_backbone_design.data import so3_utils
 from rna_backbone_design.data import utils as du
@@ -53,7 +54,13 @@ class Interpolant:
     def igso3(self):
         if self._igso3 is None:
             sigma_grid = torch.linspace(0.1, 1.5, 1000)
-            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+            # Cache directory is read from the IGSO3_CACHE_DIR env var so that
+            # Modal (or any other persistent-volume backend) can point it at a
+            # mounted volume and avoid re-computing the ~5-minute IGSO(3) CDF
+            # expansion on every container start. Default `.cache` keeps local
+            # development behaviour unchanged.
+            cache_dir = os.environ.get("IGSO3_CACHE_DIR", ".cache")
+            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=cache_dir)
         return self._igso3
 
     def set_device(self, device):
@@ -144,18 +151,29 @@ class Interpolant:
         return torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
 
     def _corrupt_trans_bridge(self, trans_1, t, res_mask, sigma_x, nu=None):
-        """Euclidean Brownian bridge in translation space.
+        """Euclidean Brownian bridge in translation space, with post-multiply
+        re-centering of the heteroscedastic noise across resolved residues.
 
-        Level 2:
-            x_t = (1 - t) x_0 + t x_1 + sigma_x * sqrt(t(1-t)) * eps
+        Level 2 (nu is None or constant):
+            x_t = (1 - t) x_0 + t x_1 + sigma_x * sqrt(t(1-t)) * eps_centered
         Level 3 (nu is a [B, N] per-residue flexibility multiplier):
-            x_{i,t} = (1 - t) x_{i,0} + t x_{i,1}
-                      + sigma_x * sqrt(nu_i) * sqrt(t(1-t)) * eps_i
+            eta_i           = sqrt(nu_i) * eps_i
+            eta_centered_i  = eta_i - mean_{k in R} eta_k    (R = resolved residues)
+            x_{i,t}         = (1 - t) x_{i,0} + t x_{i,1}
+                              + sigma_x * sqrt(t(1-t)) * eta_centered_i
 
-        When `nu is None` (or nu ≡ 1), this reduces exactly to Level 2.
-        The prior sample x_0 is drawn from the same centered-Gaussian + batch-OT
-        procedure as Level 1, so the only change from `_corrupt_trans` is the
-        additive BB noise term.
+        Why post-multiply re-centering. The deterministic Level-1 prior is a
+        centered Gaussian (zero residue-mean per sample, after batch optimal
+        transport). Heteroscedastic IID noise breaks that prior because
+        ``mean_i sqrt(nu_i) eps_i`` is in general nonzero. Subtracting the
+        residue-mean of ``eta`` *after* the per-residue scaling restores
+        ``sum_{i in R} eta_centered_i = 0`` for any nu, so the corrupted x_t
+        keeps the same residue-mean as the linear interpolation
+        ``(1-t) mean_R x_0 + t mean_R x_1``.
+
+        When ``nu is None`` (or nu ≡ 1) the centering is still applied; this
+        only nudges Level-2 corruption by O(1/m_R) below the noise floor and
+        keeps the code path uniform between L2 and L3.
         """
         trans_nm_0 = _centered_gaussian(*res_mask.shape, self._device)
         trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
@@ -163,14 +181,31 @@ class Interpolant:
 
         mean = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1  # [B, N, 3]
         # Per-batch scalar BB std: sigma_x * sqrt(t(1-t)). Shape [B, 1].
-        std = sigma_x * torch.sqrt(t * (1.0 - t) + 1e-8)
+        std = sigma_x * torch.sqrt(t * (1.0 - t) + 1e-8)              # [B, 1]
+
         if nu is None:
-            # Level 2: broadcast [B, 1] → [B, N, 3] via trailing unsqueezes.
-            std_bn = std.expand_as(res_mask)                              # [B, N]
+            eta_factor = torch.ones_like(res_mask)                    # [B, N]
         else:
-            # Level 3: sigma_x_i = sigma_x * sqrt(nu_i).
-            std_bn = std * torch.sqrt(nu.clamp(min=0.0) + 1e-12)          # [B, N]
-        noise = torch.randn_like(mean) * std_bn[..., None]                # [B, N, 3]
+            # eta_i = sqrt(nu_i) * eps_i
+            eta_factor = torch.sqrt(nu.clamp(min=0.0) + 1e-12)        # [B, N]
+
+        raw_eps = torch.randn_like(mean)                              # [B, N, 3]
+        eta = raw_eps * eta_factor[..., None]                         # [B, N, 3]
+
+        # Post-multiply re-center across RESOLVED residues per sample.
+        # res_mask is [B, N]; m_R = number of resolved residues per sample.
+        res_mask_f = res_mask.to(eta.dtype)                           # [B, N]
+        m_R = res_mask_f.sum(dim=-1, keepdim=True).clamp(min=1.0)     # [B, 1]
+        eta_sum = (eta * res_mask_f[..., None]).sum(dim=-2)           # [B, 3]
+        eta_mean = eta_sum / m_R                                      # [B, 3]
+        # Subtract eta_mean only from resolved positions; padding stays at 0
+        # because the trailing res_mask multiplication zeros it anyway.
+        eta_centered = eta - eta_mean[:, None, :] * res_mask_f[..., None]   # [B, N, 3]
+
+        # std is [B, 1]; we want [B, 1, 1] so it broadcasts cleanly across
+        # [B, N, 3]. Adding two trailing Nones would give [B, 1, 1, 1] which
+        # broadcasts catastrophically against [B, N, 3] into [B, B, N, 3].
+        noise = std[..., None] * eta_centered                          # [B, N, 3]
         trans_t = mean + noise
 
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
@@ -415,12 +450,18 @@ class Interpolant:
             "Shape mismatch between NA masks"
         )
 
-        # retrieve all-atom backbone in ATOM37 format
+        # retrieve all-atom backbone in ATOM37 format. The "noisy" trajectory
+        # comes from the SDE state in `prot_traj`; the "clean" trajectory comes
+        # from the model's per-step clean-endpoint predictions stored in
+        # `clean_traj` (each entry is the FlowModel's prediction of (x_1, R_1)
+        # at that step). Building both from `prot_traj` would have made the
+        # "clean" output identical to the noisy output and lose the predicted
+        # endpoint information.
         atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
             prot_traj, is_na_residue_mask, pred_torsions_1
         )
         clean_atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
-            prot_traj, is_na_residue_mask, pred_torsions_1
+            clean_traj, is_na_residue_mask, pred_torsions_1
         )
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
@@ -535,11 +576,12 @@ class Interpolant:
         prot_traj.append((pred_trans_1, pred_rotmats_1))
 
         is_na_residue_mask = torch.ones(num_batch, num_res, device=self._device).bool()
+        # See `sample()` for the prot_traj-vs-clean_traj distinction.
         atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
             prot_traj, is_na_residue_mask, pred_torsions_1
         )
         clean_atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
-            prot_traj, is_na_residue_mask, pred_torsions_1
+            clean_traj, is_na_residue_mask, pred_torsions_1
         )
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj

@@ -16,6 +16,9 @@ core
 tests/
 scripts/**
 ens_flow/**
+modal_app/**
+paper/**
+refine-logs/**
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files

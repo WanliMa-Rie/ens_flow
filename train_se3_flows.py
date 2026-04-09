@@ -12,6 +12,9 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers.wandb import WandbLogger
 
+from pytorch_lightning.callbacks import RichProgressBar
+from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
+
 from rna_backbone_design.data.rna_conformer_datamodule import RNAConformerDataModule
 from rna_backbone_design.models.flow_module import FlowModule
 import rna_backbone_design.utils as eu
@@ -51,10 +54,41 @@ class Experiment:
         if isinstance(logger.experiment.config, wandb.sdk.wandb_config.Config):
             logger.experiment.config.update(flat_cfg)
 
-        # Define trainer
+        # Progress reporting.
+        #
+        # Lightning's default `TQDMProgressBar` is silent in non-TTY pipes
+        # (`modal run --detach`, `nohup`, CI logs). We use `RichProgressBar`
+        # with `force_terminal=True` so that Rich emits ANSI color codes
+        # unconditionally; Modal's log viewer renders the colors. In a real
+        # local TTY (`modal run` without `--detach`) the same callback shows
+        # a true in-place updating colored bar.
+        rich_theme = RichProgressBarTheme(
+            description="bright_white",
+            progress_bar="green1",
+            progress_bar_finished="bright_green",
+            progress_bar_pulse="#7c4dff",
+            batch_progress="bright_white",
+            time="cyan",
+            processing_speed="bright_magenta",
+            metrics="bright_yellow",
+            metrics_text_delimiter=" ",
+            metrics_format=".4f",
+        )
+        rich_bar = RichProgressBar(
+            refresh_rate=1,
+            leave=False,
+            theme=rich_theme,
+            console_kwargs={
+                "force_terminal": True,
+                "color_system": "256",
+                "width": 160,
+            },
+        )
+
         trainer = Trainer(
             **self._exp_cfg.trainer,
             logger=logger,
+            callbacks=[rich_bar],
             enable_progress_bar=True,
             enable_model_summary=True,
             devices="auto",

@@ -127,9 +127,12 @@ environments = ["platform_system == 'Linux' and platform_machine == 'x86_64'"]
 [tool.uv.extra-build-dependencies]
 # `flash-attn` imports `torch` during wheel build; ensure build isolation has it.
 #flash-attn = ["torch"]
-torch-cluster = ["torch"]
-torch-scatter = ["torch"]
-torch-geometric = ["torch"]
+# torch-scatter / torch-cluster also `import numpy` in setup.py, so numpy must
+# be present in the isolated build env or the wheel falls back to a broken
+# CPU-only build.
+torch-cluster = ["torch", "numpy"]
+torch-scatter = ["torch", "numpy"]
+torch-geometric = ["torch", "numpy"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }

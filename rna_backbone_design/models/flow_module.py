@@ -76,6 +76,14 @@ class FlowModule(LightningModule):
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
 
+        # Inference-time orchestration attrs. Populated externally by
+        # `inference_se3_flows.py` before `predict_step` is called. Initialized
+        # to `None` here so that an early/accidental `predict_step` invocation
+        # fails with a clear AttributeError-equivalent rather than a silent
+        # ``has no attribute`` crash.
+        self._infer_cfg = None
+        self._output_dir = None
+
         self.validation_epoch_metrics_by_loader = {"ensemble": [], "single": []}
         self.validation_epoch_samples = []
         self.save_hyperparameters()
@@ -417,53 +425,93 @@ class FlowModule(LightningModule):
     def _compute_flex_losses(self, nu, res_mask, b_factors):
         """Level 3: B-factor alignment + log-space regularizer.
 
-        L_B  = per-sample mean of (log nu_i - log b_hat_i)^2 on valid residues,
-               averaged over samples that have >=2 valid residues with nonzero
-               b_factor (others contribute 0). ``b_hat_i = b_i / mean_k(b_k)``
-               is the per-sample mean-1 normalized B-factor, which makes the
-               simplified derivation ``b_hat_i = nu_i`` exact under the assumed
-               constant ``kappa_i`` (see architecture_report.md §3.5).
-        L_nu = mean over resolved residues of (log nu_i)^2. A weak regularizer.
+        L_B = per-sample mean of (log nu_validB_i - log b_hat_i)^2 on the
+              valid-B residue set, averaged over samples that pass the
+              sample-level gate. The valid-B set requires (a) the residue is
+              resolved, (b) ``b_i > min_valid_bfactor``, AND the sample passes
+              (c) ``|valid-B| >= 2``, (d) ``mean(b_valid) > 0``, AND
+              (e) ``std(b_valid) > min_std_bfactor``. The std gate (e) drops
+              uniform-positive samples (e.g. cryo-EM with refined-but-uniform
+              B-factors) that would otherwise dilute supervision toward
+              ``nu -> 1``.
+
+              Inside the loss, ``nu`` is *re-normalized over the valid-B mask*
+              before comparison: ``nu_validB_i = nu_i / mean_{j in valid}
+              nu_j``. The bridge corruption still uses the sequence-normalized
+              nu from the head; the dual normalization is purely a loss-internal
+              operation. Under the constant-kappa assumption AND the centered
+              translation bridge, the relation ``nu_validB_i = b_hat_i`` holds
+              **asymptotically** in m_R with an O(1/m_R) multiplicative
+              correction whose coefficient size is bounded by ~3.4% on the
+              dataset's length distribution and is below the noise floor of
+              crystallographic B-factors. The L_B form below is therefore the
+              asymptotic surrogate of an exactly anchored target. See
+              architecture_report.md §3.5 and the EnsFlow paper Appendix C
+              ("Centered-bridge B-factor proxy") for the full derivation.
+
+        L_nu = batch-pooled mean over resolved residues of (log nu_i)^2.
+               A weak log-space regularizer.
 
         Args:
             nu: ``[B, N]`` per-residue flexibility (undetached path to ψ).
-            res_mask: ``[B, N]`` 0/1 residue mask.
+            res_mask: ``[B, N]`` 0/1 residue mask (resolved).
             b_factors: ``[B, N]`` raw per-residue B-factors from PDB.
 
         Returns:
             (L_B, L_nu, n_valid_samples)
         """
         min_b = float(self._bfactor_cfg.min_valid_bfactor)
+        min_std = float(getattr(self._bfactor_cfg, "min_std_bfactor", 0.5))
 
-        # log(nu) with a small clamp for numerical safety.
+        # log(nu) with a small clamp for numerical safety. Used by L_nu only;
+        # L_B uses a re-normalized log_nu_validB computed below.
         log_nu = torch.log(nu.clamp(min=1e-8))
 
-        # --- L_nu : log-space regularizer over resolved residues ---
+        # --- L_nu : batch-pooled log-space regularizer over resolved residues ---
         res_mask_f = res_mask.to(nu.dtype)
         n_res = res_mask_f.sum().clamp(min=1.0)
         L_nu = (log_nu ** 2 * res_mask_f).sum() / n_res
 
-        # --- L_B : sample-level validity gating + per-residue gating ---
+        # --- L_B : sample-level validity gating + per-residue valid-B mask ---
         # Per-residue validity: resolved AND b_factor > min_valid.
         valid = (res_mask > 0.5) & (b_factors > min_b)
         valid_f = valid.to(b_factors.dtype)
         n_valid_per_sample = valid_f.sum(dim=-1)                    # [B]
+        n_safe = n_valid_per_sample.clamp(min=1.0)                  # [B]
 
         # Per-sample mean B (over valid residues).
         b_masked = b_factors * valid_f
-        b_mean = b_masked.sum(dim=-1) / n_valid_per_sample.clamp(min=1.0)  # [B]
+        b_mean = b_masked.sum(dim=-1) / n_safe                      # [B]
 
-        # Sample-level gate: need at least 2 valid residues and a nonzero mean.
-        good = (n_valid_per_sample >= 2) & (b_mean > 0)             # [B] bool
-        # Normalize: b_hat_i = b_i / b_mean. Clamp b_mean to avoid div-by-zero
-        # (for bad samples, the value is masked out anyway via `good`).
-        b_hat = b_factors / b_mean.clamp(min=1e-8)[:, None]         # [B, N]
-        log_b_hat = torch.log(b_hat.clamp(min=1e-8))                # [B, N]
+        # Per-sample variance for the std gate. Var = E[X^2] - E[X]^2 over the
+        # valid-B mask.
+        b_sq_masked = (b_factors ** 2) * valid_f
+        b_sq_mean = b_sq_masked.sum(dim=-1) / n_safe                # [B]
+        b_var = (b_sq_mean - b_mean ** 2).clamp(min=0.0)            # [B]
+        b_std = torch.sqrt(b_var + 1e-12)                            # [B]
 
-        diff2 = (log_nu - log_b_hat) ** 2                           # [B, N]
-        # Per-sample mean over valid residues.
-        per_sample = (diff2 * valid_f).sum(dim=-1) / n_valid_per_sample.clamp(min=1.0)
-        # Mask bad samples to zero and average over good samples only.
+        # Sample-level gate: at least 2 valid + nonzero mean + nonzero std.
+        # The std gate rules out uniform-positive samples that would supervise
+        # nu -> 1 and dilute the per-residue signal.
+        good = (n_valid_per_sample >= 2) & (b_mean > 0) & (b_std > min_std)
+
+        # Re-normalize nu over the valid-B mask for the loss comparison so that
+        # the asymptotic identity nu_validB_i = b_hat_i holds (modulo the
+        # O(1/m_R) correction documented in Appendix C of the paper). Bad
+        # samples are masked out below via `good_f`, so a div-by-zero clamp on
+        # nu_mean_validB is purely defensive.
+        nu_masked = nu * valid_f
+        nu_mean_validB = nu_masked.sum(dim=-1) / n_safe              # [B]
+        nu_validB = nu / nu_mean_validB.clamp(min=1e-8)[:, None]     # [B, N]
+        log_nu_validB = torch.log(nu_validB.clamp(min=1e-8))         # [B, N]
+
+        # b_hat_i = b_i / b_mean over the valid-B mask. Clamp b_mean to avoid
+        # div-by-zero (bad samples are masked via `good`).
+        b_hat = b_factors / b_mean.clamp(min=1e-8)[:, None]          # [B, N]
+        log_b_hat = torch.log(b_hat.clamp(min=1e-8))                 # [B, N]
+
+        diff2 = (log_nu_validB - log_b_hat) ** 2                     # [B, N]
+        per_sample = (diff2 * valid_f).sum(dim=-1) / n_safe          # [B]
         good_f = good.to(per_sample.dtype)
         n_good = good_f.sum().clamp(min=1.0)
         L_B = (per_sample * good_f).sum() / n_good
@@ -489,8 +537,17 @@ class FlowModule(LightningModule):
         nu_raw = None
         if self._level >= 3:
             # Forward the flex head *with* gradients so L_B / L_nu can train ψ.
+            # IMPORTANT: nu is normalized over the *sequence mask* (positions
+            # where single_embedding is a real nucleotide, padding excluded),
+            # NOT over res_mask (which is the resolved-structure subset).
+            # Validation and predict_step already use a sequence-only mask after
+            # stripping padding via is_na_residue_mask, so this keeps the head's
+            # normalization contract identical across train/val/predict.
+            seq_mask = batch["is_na_residue_mask"].to(
+                batch["single_embedding"].dtype
+            )                                                          # [B, N]
             nu_raw = self.flexibility_net(
-                batch["single_embedding"], batch["res_mask"]
+                batch["single_embedding"], seq_mask
             )  # [B, N]
             # Bridge sampling uses a detached nu so L_bridge does NOT train ψ.
             noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_raw.detach())

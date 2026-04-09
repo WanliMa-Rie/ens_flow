@@ -1,8 +1,5 @@
 """Modal image for ens_flow training.
 
-modal volume put ens-flow-data \                                            
-    /Users/wanlima/Projects/ensemble_dataset.tar.gz \                    
-    /raw/ensemble_dataset.tar.gz
 Build strategy:
   1. CUDA 12.6 devel base (matches `pytorch-cu126` in pyproject and gives nvcc
      so torch-cluster / torch-scatter can compile from source if no wheel).
@@ -33,6 +30,9 @@ image = (
             "CUDA_HOME": "/usr/local/cuda",
             "PATH": "/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "TORCH_CUDA_ARCH_LIST": TORCH_CUDA_ARCH_LIST,
+            # Build CUDA kernels for torch-scatter / torch-cluster even though
+            # there is no GPU attached at image-build time.
+            "FORCE_CUDA": "1",
             "UV_PROJECT_ENVIRONMENT": "/opt/venv",
             "VIRTUAL_ENV": "/opt/venv",
             "UV_LINK_MODE": "copy",
@@ -41,6 +41,8 @@ image = (
     .apt_install(
         "git",
         "build-essential",
+        "clang",  # cpdb-protein (transitive via graphein) builds a C ext with clang
+        "libomp-dev",  # omp.h for clang when compiling torch-scatter / torch-cluster
         "wget",
         "ca-certificates",
         "libgl1",
@@ -96,4 +98,8 @@ image = (
             "*.blg",
         ],
     )
+    # Make the `modal_app` package importable in the container (lands at
+    # /root/modal_app/, which is on PYTHONPATH). The entrypoint script gets
+    # copied to /root/train.py and does `from modal_app.image import image`.
+    .add_local_python_source("modal_app")
 )
