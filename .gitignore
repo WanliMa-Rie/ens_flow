@@ -17,8 +17,8 @@ tests/
 scripts/**
 ens_flow/**
 modal_app/**
-paper/**
 refine-logs/**
+configs/**
 
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files
