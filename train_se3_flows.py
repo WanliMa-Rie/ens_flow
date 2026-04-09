@@ -61,14 +61,8 @@ class Experiment:
         # does not honor.
         bar = TQDMProgressBar(refresh_rate=1)
 
-        # Persistent best-of-RMSD checkpoint at /projects/u6bk/wanli/ensflow_model/<wandb_name>/
-        run_ckpt_dir = os.path.join(
-            "/projects/u6bk/wanli/ensflow_model", self._exp_cfg.wandb.name
-        )
-        os.makedirs(run_ckpt_dir, exist_ok=True)
-        log.info(f"Best/last model checkpoints saved to {run_ckpt_dir}")
         ckpt_callback = ModelCheckpoint(
-            dirpath=run_ckpt_dir,
+            dirpath=ckpt_dir,
             filename="best-{epoch:04d}-{valid/ensemble_amr_recall:.4f}",
             monitor="valid/ensemble_amr_recall",
             mode="min",
