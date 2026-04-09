@@ -12,7 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers.wandb import WandbLogger
 
-from pytorch_lightning.callbacks import TQDMProgressBar
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
 from rna_backbone_design.data.rna_conformer_datamodule import RNAConformerDataModule
 from rna_backbone_design.models.flow_module import FlowModule
@@ -61,10 +61,26 @@ class Experiment:
         # does not honor.
         bar = TQDMProgressBar(refresh_rate=1)
 
+        # Persistent best-of-RMSD checkpoint at /projects/u6bk/wanli/ensflow_model/<wandb_name>/
+        run_ckpt_dir = os.path.join(
+            "/projects/u6bk/wanli/ensflow_model", self._exp_cfg.wandb.name
+        )
+        os.makedirs(run_ckpt_dir, exist_ok=True)
+        log.info(f"Best/last model checkpoints saved to {run_ckpt_dir}")
+        ckpt_callback = ModelCheckpoint(
+            dirpath=run_ckpt_dir,
+            filename="best-{epoch:04d}-{valid/ensemble_amr_recall:.4f}",
+            monitor="valid/ensemble_amr_recall",
+            mode="min",
+            save_top_k=1,
+            save_last=True,
+            auto_insert_metric_name=False,
+        )
+
         trainer = Trainer(
             **self._exp_cfg.trainer,
             logger=logger,
-            callbacks=[bar],
+            callbacks=[bar, ckpt_callback],
             enable_progress_bar=True,
             enable_model_summary=True,
             devices="auto",
