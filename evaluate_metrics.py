@@ -45,10 +45,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── paths ────────────────────────────────────────────────────────────────
-DATA_DIR = "/projects/u6bk/wanli/ensemble_dataset"
+DATA_DIR = "/projects/u6bk/wanli/ensemble_data_filtered"
 PREPROCESSED_DIR = os.path.join(DATA_DIR, "preprocessed_data")
 INFERENCE_ROOT = "/projects/u6bk/wanli/inference_ours"
 SPLIT_JSON = os.path.join(DATA_DIR, "split_cdhit80.json")
+
+# Coverage-metric RMSD thresholds (Å). Keep `evaluate_method` and
+# `print_summary` in sync by sourcing both from this constant.
+COV_DELTAS = (3.5, 4.5, 5.0)
 
 
 # ── structure parsing ────────────────────────────────────────────────────
@@ -279,7 +283,9 @@ def evaluate_method(
             gt_ens = gt_ensemble[cluster_name].float()  # [K, L, 3]
             ens_mask = mask.float()                      # [L]
             try:
-                ens_result = compute_ensemble_metrics(pred_c4, gt_ens, ens_mask)
+                ens_result = compute_ensemble_metrics(
+                    pred_c4, gt_ens, ens_mask, deltas=COV_DELTAS
+                )
                 row.update(ens_result)
             except Exception as e:
                 log.warning(f"Ensemble metrics failed for {method_name}/{cluster_name}: {e}")
@@ -291,13 +297,10 @@ def evaluate_method(
 
 def print_summary(df: pd.DataFrame):
     """Print per-method summary statistics, separated by split."""
-    metric_cols = [
-        "rmsd", "tm_score",
-        "amr_recall", "amr_precision",
-        "cov_recall_3.0", "cov_precision_3.0",
-        "cov_recall_4.0", "cov_precision_4.0",
-        "pairwise_rmsd",
-    ]
+    metric_cols = ["rmsd", "tm_score", "amr_recall", "amr_precision"]
+    for d in COV_DELTAS:
+        metric_cols += [f"cov_recall_{d}", f"cov_precision_{d}"]
+    metric_cols.append("pairwise_rmsd")
 
     for method, mdf in df.groupby("method"):
         log.info(f"\n{'=' * 60}")
