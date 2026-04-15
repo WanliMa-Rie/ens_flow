@@ -3,6 +3,7 @@ Runtime datasets for preprocessed RNA conformer records.
 """
 
 import pathlib
+import re
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -12,6 +13,21 @@ from torch.utils.data import Dataset
 from rna_backbone_design import utils as eu
 
 logger = eu.get_pylogger(__name__)
+
+# Synthetic completion models are emitted by the preprocessing pipeline with a
+# conformer_name of the form "<PDBID>_<chain>_cNNN_model". They are useful
+# training-time augmentation (they fill in experimentally-missing residues)
+# but must NOT be used as validation/eval GT — scoring predictions against
+# decoys inflates wandb metrics and has no biological meaning. Only real
+# experimental structures survive this filter for non-train splits.
+_DECOY_CONFORMER_RE = re.compile(r"_c\d+_model$")
+
+
+def _is_decoy_record(record: Dict[str, Any]) -> bool:
+    name = record.get("conformer_name")
+    if name is None:
+        return False
+    return bool(_DECOY_CONFORMER_RE.search(str(name)))
 
 
 class _BaseRNAConformerDataset(Dataset):
@@ -35,6 +51,20 @@ class _BaseRNAConformerDataset(Dataset):
         n_dropped = len(all_records) - len(self.records)
         if n_dropped > 0:
             logger.info(f"[{split}] Dropped {n_dropped} records with fewer than 16 resolved residues")
+
+        # Drop synthetic completion models from validation/test splits so that
+        # GT always reflects real experimental structures. Training still sees
+        # them as augmentation.
+        if split != "train":
+            before = len(self.records)
+            self.records = [r for r in self.records if not _is_decoy_record(r)]
+            n_decoy = before - len(self.records)
+            if n_decoy > 0:
+                logger.info(
+                    f"[{split}] Dropped {n_decoy} synthetic '_cNNN_model' records; "
+                    f"{len(self.records)} real experimental records remain"
+                )
+
         if max_seq_len is not None:
             before = len(self.records)
             self.records = [r for r in self.records if int(r["seq_len"]) <= max_seq_len]
@@ -92,7 +122,7 @@ class _BaseRNAConformerDataset(Dataset):
 class RNAConformerDataset(_BaseRNAConformerDataset):
     """
     Sample-level dataset where each index corresponds to one conformer.
-    Containing "train", "val_single", and "test_single" splits.
+    Used for the "train" and "test_single" splits.
     """
 
     ensemble_as_cluster = False

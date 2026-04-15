@@ -1,5 +1,5 @@
 """
-Helper functions to create and save RNA structures as PDB files
+Helper functions to create and save RNA structures as PDB / CIF files
 
 Code adapted from
 https://github.com/Profluent-Internships/MMDiff/blob/main/src/models/components/pdb/analysis_utils.py
@@ -9,6 +9,7 @@ import numpy as np
 import os, re
 from pathlib import Path
 from rna_backbone_design.data import complex
+from rna_backbone_design.data import nucleotide_constants
 
 def create_full_complex(
     atom37: np.ndarray,
@@ -132,3 +133,87 @@ def write_complex_to_pdbs(
     
     # return protein_save_path, na_save_path, save_path
     return na_save_path
+
+
+def write_complex_to_cif(
+    complex_pos: np.ndarray,
+    output_filepath: str,
+    aatype: np.ndarray = None,
+    chain_index: np.ndarray = None,
+    b_factors: np.ndarray = None,
+) -> str:
+    """Write RNA atom37 coordinates to mmCIF format using BioPython.
+
+    Args:
+        complex_pos: [num_res, num_atoms, 3] coordinate array.
+        output_filepath: Output path (with or without .cif suffix).
+        aatype: [num_res] nucleotide type indices into
+            ``nucleotide_constants.restypes`` (0-7).  Defaults to all adenine.
+        chain_index: [num_res] chain indices.
+        b_factors: [num_res, num_atoms] B-factor array.
+
+    Returns:
+        Path to the written CIF file.
+    """
+    from Bio.PDB.StructureBuilder import StructureBuilder
+    from Bio.PDB.mmcifio import MMCIFIO
+
+    assert complex_pos.ndim == 3 and complex_pos.shape[-1] == 3
+
+    cif_path = output_filepath if output_filepath.endswith(".cif") else output_filepath + ".cif"
+    num_res = complex_pos.shape[0]
+    num_atom_slots = complex_pos.shape[1]
+    atom37_mask = np.sum(np.abs(complex_pos), axis=-1) > 1e-7
+
+    if aatype is None:
+        aatype = np.full(num_res, 4, dtype=int)  # default: adenine
+    if chain_index is None:
+        chain_index = np.zeros(num_res, dtype=int)
+    if b_factors is None:
+        b_factors = np.zeros([num_res, num_atom_slots])
+
+    rna_atom_names = nucleotide_constants.atom_types  # 27 RNA atom names
+    chain_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+    builder = StructureBuilder()
+    builder.init_structure(Path(cif_path).stem)
+    builder.init_model(0)
+
+    prev_chain_id = None
+    for i in range(num_res):
+        restype_idx = int(aatype[i])
+        res_name = (
+            nucleotide_constants.restypes[restype_idx]
+            if restype_idx < len(nucleotide_constants.restypes)
+            else "A"
+        )
+        cid = int(chain_index[i])
+        chain_id = chain_letters[cid] if cid < len(chain_letters) else "A"
+
+        if chain_id != prev_chain_id:
+            builder.init_chain(chain_id)
+            prev_chain_id = chain_id
+
+        # (' ', seq_id, ' ') is the standard hetfield / icode for ATOM records
+        builder.init_residue(res_name, " ", i + 1, " ")
+
+        for j, atom_name in enumerate(rna_atom_names):
+            if j >= num_atom_slots:
+                break
+            if atom37_mask[i, j] < 0.5:
+                continue
+
+            coord = complex_pos[i, j].tolist()
+            bf = float(b_factors[i, j])
+            element = atom_name[0]
+
+            builder.init_atom(
+                atom_name, coord, bf, 1.0, " ", atom_name, element=element
+            )
+
+    structure = builder.get_structure()
+    io = MMCIFIO()
+    io.set_structure(structure)
+    io.save(cif_path)
+
+    return cif_path

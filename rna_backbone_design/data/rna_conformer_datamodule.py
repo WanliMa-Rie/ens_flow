@@ -84,13 +84,11 @@ class RNAConformerDataModule(LightningDataModule):
         self.pin_memory = bool(data_cfg.pin_memory)
         self.persistent_workers = bool(data_cfg.persistent_workers) and self.num_workers > 0
         self.drop_last = bool(data_cfg.drop_last)
-        self.val_ensemble_as_cluster = bool(data_cfg.val_ensemble_as_cluster)
         self.test_ensemble_as_cluster = bool(data_cfg.test_ensemble_as_cluster)
         self.max_seq_len = int(data_cfg.max_seq_len) if getattr(data_cfg, "max_seq_len", None) is not None else None
 
         self.train_dataset: Optional[RNAConformerDataset] = None
-        self.val_ensemble_dataset: Optional[Dataset] = None
-        self.val_single_dataset: Optional[RNAConformerDataset] = None
+        # No separate val split: validation runs on the test datasets.
         self.test_ensemble_dataset: Optional[Dataset] = None
         self.test_single_dataset: Optional[RNAConformerDataset] = None
 
@@ -123,21 +121,35 @@ class RNAConformerDataModule(LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         root = self.preprocessed_dir
-        if stage in (None, "fit", "validate"):
+        if stage in (None, "fit"):
             self.train_dataset = self._make_dataset(root / "train_conformers.pt", "train")
-            self.val_ensemble_dataset = self._make_dataset(root / "val_ensemble_conformers.pt", "val_ensemble", as_cluster=self.val_ensemble_as_cluster)
-            self.val_single_dataset = self._make_dataset(root / "val_single_conformers.pt", "val_single")
-        if stage in (None, "test"):
-            self.test_ensemble_dataset = self._make_dataset(root / "test_ensemble_conformers.pt", "test_ensemble", as_cluster=self.test_ensemble_as_cluster)
-            self.test_single_dataset = self._make_dataset(root / "test_single_conformers.pt", "test_single")
+        # The test datasets double as the validation datasets: there is no
+        # separate val split in split_cdhit80.json.
+        if stage in (None, "fit", "validate", "test"):
+            if self.test_ensemble_dataset is None:
+                self.test_ensemble_dataset = self._make_dataset(
+                    root / "test_ensemble_conformers.pt",
+                    "test_ensemble",
+                    as_cluster=self.test_ensemble_as_cluster,
+                )
+            if self.test_single_dataset is None:
+                # Also cluster-level so each cluster is scored once with all its
+                # real experimental conformers as GT ensemble. The underlying
+                # dataset already drops synthetic '_cNNN_model' decoys for
+                # non-train splits.
+                self.test_single_dataset = self._make_dataset(
+                    root / "test_single_conformers.pt", "test_single",
+                    as_cluster=True,
+                )
 
     def train_dataloader(self) -> DataLoader:
         return self._make_loader(self.train_dataset, shuffle=True)
 
     def val_dataloader(self) -> List[DataLoader]:
+        # Validation runs on the test datasets (no separate val split).
         return [
-            self._make_loader(self.val_ensemble_dataset, shuffle=False),
-            self._make_loader(self.val_single_dataset, shuffle=False),
+            self._make_loader(self.test_ensemble_dataset, shuffle=False),
+            self._make_loader(self.test_single_dataset, shuffle=False),
         ]
 
     def test_dataloader(self) -> List[DataLoader]:

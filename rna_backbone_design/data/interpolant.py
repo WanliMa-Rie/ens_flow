@@ -205,11 +205,11 @@ class Interpolant:
         # std is [B, 1]; we want [B, 1, 1] so it broadcasts cleanly across
         # [B, N, 3]. Adding two trailing Nones would give [B, 1, 1, 1] which
         # broadcasts catastrophically against [B, N, 3] into [B, B, N, 3].
-        noise = std[..., None] * eta_centered                          # [B, N, 3]
-        trans_t = mean + noise
+        bridge_noise = std[..., None] * eta_centered                     # [B, N, 3]
+        trans_t = mean + bridge_noise
 
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
-        return trans_t * res_mask[..., None]
+        return trans_t * res_mask[..., None], bridge_noise * res_mask[..., None]
 
     def _corrupt_rotmats_bridge(self, rotmats_1, t, res_mask, sigma_omega, nu=None):
         """Tangent-space-lifted Brownian bridge on SO(3).
@@ -239,8 +239,8 @@ class Interpolant:
             std_bn = std.expand_as(res_mask)                       # [B, N]
         else:
             std_bn = std * torch.sqrt(nu.clamp(min=0.0) + 1e-12)   # [B, N]
-        noise = torch.randn_like(omega) * std_bn[..., None]        # [B, N, 3]
-        Omega_t = t[..., None] * omega + noise                     # [B, N, 3]
+        bridge_noise = torch.randn_like(omega) * std_bn[..., None]  # [B, N, 3]
+        Omega_t = t[..., None] * omega + bridge_noise              # [B, N, 3]
 
         # Push forward to SO(3): R_t = R_0 @ Exp(hat(Omega_t))
         delta_R = so3_utils.rotvec_to_rotmat(Omega_t)              # [B, N, 3, 3]
@@ -250,7 +250,7 @@ class Interpolant:
         rotmats_t = rotmats_t * res_mask[..., None, None] + identity[None, None] * (
             1 - res_mask[..., None, None]
         )
-        return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask)
+        return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask), bridge_noise * res_mask[..., None]
 
     def corrupt_batch(self, batch, nu=None):
         """
@@ -292,12 +292,14 @@ class Interpolant:
         if self._level >= 2:
             sigma_x = float(self._bridge_cfg.bridge.sigma_x)
             sigma_omega = float(self._bridge_cfg.bridge.sigma_omega)
-            trans_t = self._corrupt_trans_bridge(
+            trans_t, trans_bridge_noise = self._corrupt_trans_bridge(
                 trans_1, t, res_mask, sigma_x, nu=nu
             )
-            rotmats_t = self._corrupt_rotmats_bridge(
+            rotmats_t, rot_bridge_noise = self._corrupt_rotmats_bridge(
                 rotmats_1, t, res_mask, sigma_omega, nu=nu
             )
+            noisy_batch["trans_bridge_noise"] = trans_bridge_noise
+            noisy_batch["rot_bridge_noise"] = rot_bridge_noise
         else:
             trans_t = self._corrupt_trans(trans_1, t, res_mask)
             rotmats_t = self._corrupt_rotmats(rotmats_1, t, res_mask)
@@ -337,44 +339,113 @@ class Interpolant:
 
         return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
 
-    def _trans_euler_maruyama_step(self, d_t, t, trans_1, trans_t, a_trans):
-        """Euler-Maruyama step for translations: drift + diffusion.
+    def _bridge_sde_step(
+        self,
+        d_t,
+        t,
+        pred_trans_1,
+        pred_rotmats_1,
+        trans_t,
+        rotmats_t,
+        res_mask,
+        tau,
+        nu=None,
+    ):
+        """Bridge-consistent Euler-Maruyama step on SE(3)^L.
 
-        Implements: x_{k+1} = x_k + Δt·v_{x,θ} + √Δt · a_{x,ψ} · ξ_k
-        (Section 5, with U_{x,θ}=I)
+        The drift is identical to the deterministic ODE under the `linear`
+        rotation schedule, so the step reduces to the ODE when ``tau == 0``.
+        The diffusion term follows the training bridge envelope
+        ``sigma * sqrt(t(1-t))`` per unit time with an optional per-residue
+        flexibility multiplier ``sqrt(nu_i)``. Translation noise is
+        re-centered across resolved residues (mirrors the training-time
+        post-multiply recentering in ``_corrupt_trans_bridge``) so the
+        sample stays zero CoM. Rotation noise lives in the Lie algebra
+        and is added inside the exp.
+
+        Interpretation: this is bridge-shaped annealed Langevin on top of
+        the SFM-corrected flow drift, not a textbook reverse SDE of the
+        forward bridge. The ``alpha`` envelope matches training per unit
+        time, so ``tau = 1`` corresponds to training-bridge-matched noise
+        injection.
+
+        Requires ``self._bridge_cfg`` and ``self._level >= 2``.
         """
-        trans_vf = (trans_1 - trans_t) / (1 - t)
-        noise = torch.randn_like(trans_t)
-        return trans_t + trans_vf * d_t + a_trans[..., None] * noise * d_t.sqrt()
+        if self._bridge_cfg is None or self._level < 2:
+            raise ValueError(
+                "Bridge-SDE sampler requires a stochastic_bridge config at level >= 2."
+            )
+        sigma_x = float(self._bridge_cfg.bridge.sigma_x)
+        sigma_omega = float(self._bridge_cfg.bridge.sigma_omega)
 
-    def _rots_euler_maruyama_step(self, d_t, t, rotmats_1, rotmats_t, a_rots):
-        """Euler-Maruyama step on SO(3): geodesic drift + tangent-space noise.
-
-        Implements: R_{k+1} = R_k exp(Δt·ω_θ + √Δt · σ_ω · ζ_k)
-        """
-        if self._rots_cfg.sample_schedule == "linear":
-            scaling = 1 / (1 - t)
-        elif self._rots_cfg.sample_schedule == "exp":
-            scaling = self._rots_cfg.exp_rate
+        # sqrt(t(1-t)) envelope. ``t`` is the 0-dim scalar `t_1` from the
+        # outer loop, so this stays 0-dim.
+        t_envelope = torch.sqrt(t * (1.0 - t) + 1e-8)
+        if nu is None:
+            # Scalar noise scale — broadcasts against [B, N, 3] directly.
+            trans_noise_scale = sigma_x * tau * t_envelope
+            rot_noise_scale = sigma_omega * tau * t_envelope
         else:
-            raise ValueError(f"Unknown sample schedule {self._rots_cfg.sample_schedule}")
-        rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
-        noise = torch.randn_like(rot_vf)
-        total_rotvec = scaling * d_t * rot_vf + a_rots[..., None] * noise * d_t.sqrt()
-        delta_rot = so3_utils.rotvec_to_rotmat(total_rotvec)
-        return torch.einsum("...ij,...jk->...ik", rotmats_t, delta_rot)
+            nu_sqrt = torch.sqrt(nu.clamp(min=0.0) + 1e-12)            # [B, N]
+            alpha_bn = tau * nu_sqrt * t_envelope                      # [B, N]
+            trans_noise_scale = sigma_x * alpha_bn[..., None]          # [B, N, 1]
+            rot_noise_scale = sigma_omega * alpha_bn[..., None]        # [B, N, 1]
 
-    def sample(self, num_batch, num_res, model, context=None):
+        sqrt_dt = d_t.sqrt()
+
+        # --- Translations: ODE drift + CoM-recentered bridge noise ------
+        trans_vf = (pred_trans_1 - trans_t) / (1 - t)
+        xi_x = torch.randn_like(trans_t)                                # [B, N, 3]
+        res_mask_f = res_mask.to(xi_x.dtype)                            # [B, N]
+        m_R = res_mask_f.sum(dim=-1, keepdim=True).clamp(min=1.0)       # [B, 1]
+        xi_sum = (xi_x * res_mask_f[..., None]).sum(dim=-2)             # [B, 3]
+        xi_mean = xi_sum / m_R                                          # [B, 3]
+        xi_x_tilde = xi_x - xi_mean[:, None, :] * res_mask_f[..., None]
+        trans_new = (
+            trans_t + trans_vf * d_t + trans_noise_scale * xi_x_tilde * sqrt_dt
+        )
+
+        # --- Rotations: linear-schedule drift + tangent-space bridge noise
+        rot_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1)
+        xi_R = torch.randn_like(rot_vf)                                 # [B, N, 3]
+        omega_step = (d_t / (1 - t)) * rot_vf + rot_noise_scale * xi_R * sqrt_dt
+        delta_R = so3_utils.rotvec_to_rotmat(omega_step)
+        rotmats_new = torch.einsum("...ij,...jk->...ik", rotmats_t, delta_R)
+
+        return trans_new, rotmats_new
+
+    def sample(self, num_batch, num_res, model, context=None, tau=None, nu=None):
         """
         Params:
             num_batch : number of independent samples
             num_res : number of nucleotides to model
             model : the parameterised vector field (ie, the "denoiser")
             context: dict containing conditioning information (single_embedding, pair_embedding)
+            tau : optional global noise temperature for the bridge-consistent
+                stochastic sampler. ``tau is None`` or ``tau == 0.0`` runs
+                the deterministic ODE (bit-identical to the legacy path).
+                ``tau > 0`` injects Gaussian bridge-shaped noise whose
+                per-unit-time variance matches the training bridge:
+                ``alpha_i(t) = tau * sqrt(nu_i) * sqrt(t(1-t))``. Requires
+                ``self._level >= 2`` (bridge config must be present).
+            nu : optional ``[num_batch, num_res]`` per-residue flexibility
+                multiplier from the Level-3 FlexibilityNet. Already mean-1
+                normalized per sample. ``None`` falls back to ``nu_i ≡ 1``
+                (i.e. the homoscedastic Level-2 sampler). Only consulted
+                when ``tau > 0``.
 
         Returns:
             Generated backbone samples in the ATOM37 format
         """
+
+        tau_f = 0.0 if tau is None else float(tau)
+        if tau_f > 0.0 and (self._bridge_cfg is None or self._level < 2):
+            raise ValueError(
+                "Stochastic sampling (tau > 0) requires Interpolant to be "
+                "constructed with a stochastic_bridge config at level >= 2."
+            )
+        if nu is not None:
+            nu = nu.to(self._device)
 
         res_mask = torch.ones(num_batch, num_res, device=self._device)
 
@@ -420,8 +491,24 @@ class Interpolant:
             # take reverse step
             d_t = t_2 - t_1
 
-            trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
-            rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            if tau_f == 0.0:
+                # Deterministic ODE: bit-identical to the legacy path.
+                trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
+                rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            else:
+                # Bridge-consistent SDE. All randomness lives inside this
+                # branch so `tau == 0.0` preserves byte-identity with the ODE.
+                trans_t_2, rotmats_t_2 = self._bridge_sde_step(
+                    d_t,
+                    t_1,
+                    pred_trans_1,
+                    pred_rotmats_1,
+                    trans_t_1,
+                    rotmats_t_1,
+                    res_mask,
+                    tau_f,
+                    nu,
+                )
             prot_traj.append((trans_t_2, rotmats_t_2))
 
             t_1 = t_2
@@ -457,126 +544,6 @@ class Interpolant:
         # at that step). Building both from `prot_traj` would have made the
         # "clean" output identical to the noisy output and lose the predicted
         # endpoint information.
-        atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
-            prot_traj, is_na_residue_mask, pred_torsions_1
-        )
-        clean_atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
-            clean_traj, is_na_residue_mask, pred_torsions_1
-        )
-
-        return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
-
-    def sample_bridge(self, num_batch, num_res, model, context=None, nu=None):
-        """Level 2 / Level 3 inference: Euler-Maruyama on SE(3).
-
-        At each step the drift model predicts (x_hat_1, R_hat_1), which induces
-        the same drift field as Level 1. Fixed sigma_x, sigma_omega from the
-        bridge config drive the diffusion term:
-
-            x_{k+1,i} = x_{k,i} + dt * u_theta^x
-                        + sqrt(dt) * sigma_x * sqrt(nu_i) * xi
-            R_{k+1,i} = R_{k,i} @ Exp(hat( dt * u_theta^omega
-                        + sqrt(dt) * sigma_omega * sqrt(nu_i) * zeta ))
-
-        When ``nu is None`` the per-residue multiplier defaults to 1 and
-        inference is bit-identical to Level 2.
-
-        Requires self._bridge_cfg to carry bridge.sigma_x and bridge.sigma_omega
-        (i.e. Interpolant was constructed with bridge_cfg and level >= 2).
-
-        Args:
-            num_batch: number of independent samples.
-            num_res: number of residues.
-            model: drift field network (same FlowModel used for Level 1).
-            context: conditioning dict (single_embedding, pair_embedding).
-            nu: optional ``[num_batch, num_res]`` per-residue flexibility
-                multiplier from the Level 3 FlexibilityNet. Should be detached
-                before passing (inference is no-grad anyway, but this keeps
-                the contract uniform with ``corrupt_batch``).
-
-        Returns:
-            (atom37_traj, clean_atom37_traj, clean_traj)
-        """
-        assert self._bridge_cfg is not None and self._level >= 2, (
-            "sample_bridge requires Interpolant to be constructed with a "
-            "stochastic_bridge config at level >= 2."
-        )
-        sigma_x = float(self._bridge_cfg.bridge.sigma_x)
-        sigma_omega = float(self._bridge_cfg.bridge.sigma_omega)
-
-        res_mask = torch.ones(num_batch, num_res, device=self._device)
-        trans_0 = (
-            _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
-        )
-        rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
-
-        # Broadcast-ready per-residue sigma tensors for the existing Euler-Maruyama
-        # helpers (which expect `a_trans` / `a_rots` shaped [B, N]).
-        # Level 2: constant across residues. Level 3: scale by sqrt(nu_i).
-        if nu is None:
-            nu_factor = torch.ones(num_batch, num_res, device=self._device)
-        else:
-            nu_factor = torch.sqrt(nu.to(self._device).clamp(min=0.0) + 1e-12)
-        sigma_x_tensor = sigma_x * nu_factor
-        sigma_omega_tensor = sigma_omega * nu_factor
-
-        batch = {"res_mask": res_mask}
-        if context is not None:
-            batch["single_embedding"] = context["single_embedding"]
-            batch["pair_embedding"] = context["pair_embedding"]
-
-        ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
-        t_1 = ts[0]
-
-        prot_traj = [(trans_0, rotmats_0)]
-        clean_traj = []
-
-        for t_2 in ts[1:]:
-            trans_t_1, rotmats_t_1 = prot_traj[-1]
-            batch["trans_t"] = trans_t_1
-            batch["rotmats_t"] = rotmats_t_1
-            t = torch.ones((num_batch, 1), device=self._device) * t_1
-            batch["t"] = t
-
-            with torch.no_grad():
-                model_out = model(batch)
-            pred_trans_1 = model_out["pred_trans"]
-            pred_rotmats_1 = model_out["pred_rotmats"]
-
-            clean_traj.append(
-                (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu())
-            )
-            if self._cfg.self_condition:
-                batch["trans_sc"] = pred_trans_1
-
-            d_t = t_2 - t_1
-            trans_t_2 = self._trans_euler_maruyama_step(
-                d_t, t_1, pred_trans_1, trans_t_1, sigma_x_tensor
-            )
-            rotmats_t_2 = self._rots_euler_maruyama_step(
-                d_t, t_1, pred_rotmats_1, rotmats_t_1, sigma_omega_tensor
-            )
-            prot_traj.append((trans_t_2, rotmats_t_2))
-            t_1 = t_2
-
-        # Final deterministic step: use the last model prediction as the clean endpoint.
-        t_1 = ts[-1]
-        trans_t_1, rotmats_t_1 = prot_traj[-1]
-        batch["trans_t"] = trans_t_1
-        batch["rotmats_t"] = rotmats_t_1
-        batch["t"] = torch.ones((num_batch, 1), device=self._device) * t_1
-
-        with torch.no_grad():
-            model_out = model(batch)
-
-        pred_trans_1 = model_out["pred_trans"]
-        pred_rotmats_1 = model_out["pred_rotmats"]
-        pred_torsions_1 = model_out["pred_torsions"]
-        clean_traj.append((pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu()))
-        prot_traj.append((pred_trans_1, pred_rotmats_1))
-
-        is_na_residue_mask = torch.ones(num_batch, num_res, device=self._device).bool()
-        # See `sample()` for the prot_traj-vs-clean_traj distinction.
         atom37_traj_rna = rna_all_atom.transrot_to_atom37_rna(
             prot_traj, is_na_residue_mask, pred_torsions_1
         )

@@ -1,10 +1,11 @@
 """
 Inference script for Conditional RNA-FrameFlow.
-Modified to work with test_clusters.json and save PDBs directly to cluster directories.
+Reads test clusters from split_cdhit80.json in ensemble_dataset,
+runs level-dependent sampling, and saves .cif files to the output directory.
+Metrics are computed separately via evaluate_metrics.py.
 """
 
 import os
-import time
 import json
 import numpy as np
 import hydra
@@ -20,23 +21,23 @@ from rna_backbone_design.data.rna_conformer_datamodule import (
     conformer_collate,
 )
 from rna_backbone_design.data.rna_conformer_dataset import RNAConformerDataset
-from rna_backbone_design.data.interpolant import Interpolant
-from rna_backbone_design.data import utils as du
-from rna_backbone_design.data import all_atom as rna_all_atom
-from rna_backbone_design.data import nucleotide_constants
-from rna_backbone_design.analysis import utils as au
 
 torch.set_float32_matmul_precision("high")
 log = eu.get_pylogger(__name__)
 
 
 class TestClusterDataset(torch.utils.data.Dataset):
-    """Dataset wrapper that filters RNAConformerDataset instances by cluster."""
+    """Dataset wrapper that filters cluster-level datasets by cluster name.
+
+    Both test datasets are now cluster-level (`RNAClusterDataset`), so each
+    cluster is scored exactly once — no more CIF overwrite from repeated
+    records per cluster.
+    """
 
     def __init__(self, datasets: list[RNAConformerDataset], test_cluster_names: list[str]):
         """
         Args:
-            datasets: List of RNAConformerDataset instances to search from.
+            datasets: List of cluster-level datasets to search from.
             test_cluster_names: Cluster names to include.
         """
         self.test_cluster_names = set(test_cluster_names)
@@ -45,15 +46,14 @@ class TestClusterDataset(torch.utils.data.Dataset):
         for dataset in datasets:
             if dataset is None:
                 continue
-            if dataset.ensemble_as_cluster:
-                for idx, cluster_name in enumerate(dataset.cluster_names):
-                    if cluster_name in self.test_cluster_names:
-                        self.items.append((dataset, idx, cluster_name))
-            else:
-                for idx, record in enumerate(dataset.records):
-                    cluster_name = str(record["cluster_name"])
-                    if cluster_name in self.test_cluster_names:
-                        self.items.append((dataset, idx, cluster_name))
+            if not dataset.ensemble_as_cluster:
+                raise ValueError(
+                    f"TestClusterDataset expects cluster-level datasets "
+                    f"(ensemble_as_cluster=True); got {type(dataset).__name__}."
+                )
+            for idx, cluster_name in enumerate(dataset.cluster_names):
+                if cluster_name in self.test_cluster_names:
+                    self.items.append((dataset, idx, cluster_name))
 
         log.info(
             "TestClusterDataset: found %d items for %d requested clusters",
@@ -67,8 +67,7 @@ class TestClusterDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         dataset, base_idx, cluster_name = self.items[idx]
         item = dict(dataset[base_idx])
-        short_name = "_".join(cluster_name.split("_")[:2])
-        item["cluster_id"] = short_name
+        item["cluster_id"] = cluster_name
         item["full_cluster_name"] = cluster_name
         return item
 
@@ -79,7 +78,11 @@ class Sampler:
         """Initialize sampler.
 
         Args:
-            cfg: inference config.
+            cfg: Hydra config loaded from inference.yaml (inference-only
+                 settings + optional data_cfg overrides).  The training
+                 config is loaded from the checkpoint directory and used
+                 as the base; ``cfg`` is then merged on top so that
+                 inference.yaml takes precedence.
         """
         ckpt_path = cfg.inference.ckpt_path
         if os.path.isdir(ckpt_path):
@@ -90,35 +93,47 @@ class Sampler:
             ]
             if len(ckpts) != 1:
                 raise ValueError(
-                    f"inference.ckpt_path is a directory but contains {len(ckpts)} .ckpt files: {ckpt_path}"
+                    f"inference.ckpt_path is a directory but contains "
+                    f"{len(ckpts)} .ckpt files: {ckpt_path}"
                 )
             ckpt_path = ckpts[0]
         ckpt_dir = os.path.dirname(ckpt_path)
-        # Attempt to load config from checkpoint dir
-        config_path = os.path.join(ckpt_dir, "config.yaml")
-        if not os.path.exists(config_path):
-            # Fallback to flashipa named one if exists
-            config_path = os.path.join(ckpt_dir, "config_flashipa.yaml")
-        
-        if os.path.exists(config_path):
-            ckpt_cfg = OmegaConf.load(config_path)
-            # Set-up config.
-            OmegaConf.set_struct(cfg, False)
-            OmegaConf.set_struct(ckpt_cfg, False)
-            # Merge checkpoint config with inference config (inference config overrides checkpoint)
-            cfg = OmegaConf.merge(ckpt_cfg, cfg)
-        
+
+        # Load training config from checkpoint directory (base).
+        ckpt_config_path = os.path.join(ckpt_dir, "config.yaml")
+        if not os.path.exists(ckpt_config_path):
+            ckpt_config_path = os.path.join(ckpt_dir, "config_flashipa.yaml")
+        if not os.path.exists(ckpt_config_path):
+            raise FileNotFoundError(
+                f"No config.yaml found in checkpoint directory: {ckpt_dir}"
+            )
+
+        ckpt_cfg = OmegaConf.load(ckpt_config_path)
+        OmegaConf.set_struct(ckpt_cfg, False)
+        OmegaConf.set_struct(cfg, False)
+
+        # Merge: ckpt config (model, data, training) as base,
+        # inference.yaml (inference settings + data_cfg overrides) on top.
+        cfg = OmegaConf.merge(ckpt_cfg, cfg)
+
         cfg.experiment.checkpointer.dirpath = "./"
 
         self._cfg = cfg
         self._infer_cfg = cfg.inference
         self._rng = np.random.default_rng(self._infer_cfg.seed)
 
-        # Set-up directories to write results to
-        self._output_dir = self._infer_cfg.output_dir
+        # Determine level from config (old ckpts may lack stochastic_bridge)
+        bridge_cfg = OmegaConf.select(cfg, "stochastic_bridge", default=None)
+        self._level = int(bridge_cfg.level) if bridge_cfg is not None and "level" in bridge_cfg else 1
+
+        # Output directory: /projects/u6bk/wanli/inference_ours/ens_flow{level}/
+        default_output = f"/projects/u6bk/wanli/inference_ours/ens_flow{self._level}"
+        self._output_dir = str(
+            getattr(self._infer_cfg, "output_dir", default_output) or default_output
+        )
         os.makedirs(self._output_dir, exist_ok=True)
         log.info(f"Saving results to {self._output_dir}")
-        
+
         # Save merged config for reproducibility
         with open(os.path.join(self._output_dir, "inference_config.yaml"), "w") as f:
             OmegaConf.save(config=self._cfg, f=f)
@@ -131,40 +146,42 @@ class Sampler:
         self._flow_module.eval()
         self._flow_module._infer_cfg = self._infer_cfg
         self._flow_module._output_dir = self._output_dir
+        self._flow_module._output_format = "cif"
 
     def run_sampling(self):
         devices = self._infer_cfg.num_gpus
         log.info(f"Using {devices} devices (configured via num_gpus)")
 
-        # Load test clusters from JSON
-        test_clusters_path = getattr(self._infer_cfg, "test_clusters_json", 
-                                     "/projects/u6bk/wanli/inference/test_clusters.json")
-        with open(test_clusters_path, "r") as f:
-            test_clusters_data = json.load(f)
-        
-        # Select which test split(s) to use
+        # --- Load test cluster names from split JSON in ensemble_dataset ---
+        data_dir = self._cfg.data_cfg.data_dir
+        split_json_path = os.path.join(data_dir, "split_cdhit80.json")
+        with open(split_json_path, "r") as f:
+            split_data = json.load(f)
+
+        # Select which split(s) to run inference on
         split = getattr(self._infer_cfg, "test_cluster_split", "all")
         if split in {"all", "both"}:
             all_test_clusters = []
-            if "test_single" in test_clusters_data:
-                all_test_clusters.extend(test_clusters_data["test_single"])
-            if "test_ensemble" in test_clusters_data:
-                all_test_clusters.extend(test_clusters_data["test_ensemble"])
+            if "test_single" in split_data:
+                all_test_clusters.extend(split_data["test_single"])
+            if "test_ensemble" in split_data:
+                all_test_clusters.extend(split_data["test_ensemble"])
         elif split in {"test_single", "single"}:
-            all_test_clusters = test_clusters_data.get("test_single", [])
+            all_test_clusters = split_data.get("test_single", [])
         elif split in {"test_ensemble", "ensemble"}:
-            all_test_clusters = test_clusters_data.get("test_ensemble", [])
+            all_test_clusters = split_data.get("test_ensemble", [])
         else:
             raise ValueError(
                 f"Unsupported inference.test_cluster_split='{split}'. "
                 "Use one of: all, both, test_single, single, test_ensemble, ensemble."
             )
-        
+
         log.info(
-            f"Loaded {len(all_test_clusters)} test clusters from {test_clusters_path} "
+            f"Loaded {len(all_test_clusters)} test clusters from {split_json_path} "
             f"(split={split})"
         )
 
+        # --- Build datasets via the existing DataModule ---
         datamodule = RNAConformerDataModule(self._cfg.data_cfg)
         datamodule.setup(stage="test")
 
@@ -198,17 +215,12 @@ class Sampler:
             devices=devices if torch.cuda.is_available() else "auto",
         )
 
-        start_time = time.time()
-        
-        # Override predict_step to use simpler sampling
         self._flow_module._infer_cfg = self._infer_cfg
-        
-        predict_out = trainer.predict(self._flow_module, dataloaders=dataloader)
-        elapsed_time = time.time() - start_time
 
-        log.info(f"Finished in {elapsed_time:.2f}s")
-        log.info(f"Generated samples are stored here: {self._output_dir}")
-        
+        predict_out = trainer.predict(self._flow_module, dataloaders=dataloader)
+
+        log.info(f"Generated samples stored at: {self._output_dir}")
+
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 

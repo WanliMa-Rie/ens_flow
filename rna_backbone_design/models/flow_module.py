@@ -52,7 +52,7 @@ class FlowModule(LightningModule):
         # Level 1 ignores the bridge config entirely.
         self.interpolant = Interpolant(cfg.interpolant, bridge_cfg=self._bridge_cfg)
 
-        # Level 3 components: sequence-only FlexibilityNet + B-factor loss cfg.
+        # Level 3 components: pair-biased FlexibilityNet + B-factor loss cfg.
         # At initialization nu_i ≡ 1 (zero-weight + log(e-1) bias on the final
         # Linear), so Level 3 starts byte-identical to Level 2.
         self.flexibility_net = None
@@ -62,7 +62,9 @@ class FlowModule(LightningModule):
             flex_cfg = self._bridge_cfg.flexibility
             self.flexibility_net = FlexibilityNet(
                 c_single_in=int(cfg.model.node_features.c_single_in),
+                c_pair_in=int(cfg.model.edge_features.c_pair_in),
                 hidden_dim=int(flex_cfg.hidden_dim),
+                n_heads=int(flex_cfg.n_heads),
                 eps=float(flex_cfg.eps),
             )
             self._bfactor_cfg = self._bridge_cfg.bfactor
@@ -216,6 +218,13 @@ class FlowModule(LightningModule):
             / loss_denom
         )
 
+        # SFM correction: add bridge_noise / (2t) to velocity targets (Level >= 2).
+        # Applied AFTER auxiliary losses (bb_atom, dist_mat) which use clean targets.
+        if "trans_bridge_noise" in noisy_batch:
+            sfm_scale = 1.0 / (2.0 * noisy_batch["t"].clamp(min=1e-4))  # [B, 1]
+            gt_trans_1 = gt_trans_1 + noisy_batch["trans_bridge_noise"] * sfm_scale[..., None]
+            gt_rot_vf = gt_rot_vf + noisy_batch["rot_bridge_noise"] * sfm_scale[..., None]
+
         # Translation VF loss
         trans_error = (
             (gt_trans_1 - pred_trans_1) / norm_scale * training_cfg.trans_scale
@@ -308,13 +317,29 @@ class FlowModule(LightningModule):
         return batch_losses
 
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        """
-        res_mask: [B, N]. residue mask, 0/1
-        is_na_residue_mask: [B, N]. nucletide/non-nucleotide residue mask, 0/1
-        num_res: int. number of nucletides in the sample (without padding)
-        """
+        """Per-cluster validation.
 
+        Both val loaders are now cluster-level (``RNAClusterDataset``) and
+        decoy '_cNNN_model' records are filtered out at dataset-load time, so
+        each batch item is one real cluster with:
 
+            - ``c4_coords``: anchor real experimental structure [L, 3]
+            - ``gt_c4_ensemble``: all real experimental conformers [K, L, 3]
+            - ``res_mask``: anchor residue mask [L]
+
+        Metric families are split-specific to match ``evaluate_metrics.py``:
+
+            - ``single`` loader (test_single, K==1):
+                ``rmsd`` = best-of-G RMSD vs the anchor
+                ``tm_score`` = best-of-G TM-score vs the anchor
+            - ``ensemble`` loader (test_ensemble, K>=2):
+                ``amr_recall`` / ``amr_precision`` / ``cov_*`` / ``pairwise_rmsd``
+                vs the real conformer ensemble
+
+        wandb keys end up as ``valid/single_{rmsd,tm_score}`` and
+        ``valid/ensemble_{amr_recall,...}``. ``valid/ensemble_amr_recall`` is
+        monitored by ModelCheckpoint in train_se3_flows.py.
+        """
         self.interpolant.set_device(batch["res_mask"].device)
         loader_name = "ensemble" if int(dataloader_idx) == 0 else "single"
 
@@ -339,40 +364,28 @@ class FlowModule(LightningModule):
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
 
-            if self._level >= 3:
-                # Compute nu from this sample's NA-only single_embedding and
-                # broadcast across the num_generated replicas.
-                with torch.no_grad():
-                    single_bn = na_single.unsqueeze(0)                       # [1, num_res, D]
-                    mask_bn = torch.ones(1, num_res, device=single_bn.device)
-                    nu_sample = self.flexibility_net(single_bn, mask_bn)     # [1, num_res]
-                    nu_sample = nu_sample.expand(num_generated, -1).contiguous()
-                atom37_traj, _, _ = self.interpolant.sample_bridge(
-                    num_generated, num_res, self.model, context=context, nu=nu_sample,
-                )
-            elif self._level >= 2:
-                atom37_traj, _, _ = self.interpolant.sample_bridge(
-                    num_generated, num_res, self.model, context=context,
-                )
-            else:
-                atom37_traj, _, _ = self.interpolant.sample(
-                    num_generated, num_res, self.model, context=context
-                )
+            # All levels use ODE inference (§2.8): the SFM-trained velocity
+            # field already encodes bridge stochasticity; diversity comes
+            # from different initial (x_0, R_0) samples.
+            atom37_traj, _, _ = self.interpolant.sample(
+                num_generated, num_res, self.model, context=context
+            )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]
 
             sample_metrics = {}
 
             if loader_name == "single":
-                gt_c4 = sample["c4_coords"][na_mask].unsqueeze(0).to(pred_c4.device)  # [1, num_res, 3]
+                gt_c4 = sample["c4_coords"][na_mask].unsqueeze(0).to(pred_c4.device)  # [1, L, 3]
                 single_result = metrics.compute_single_metrics(
-                    pred_c4, gt_c4, eval_mask.unsqueeze(0).to(pred_c4.device)  # [1, num_res]
+                    pred_c4, gt_c4, eval_mask.unsqueeze(0).to(pred_c4.device)
                 )
-                sample_metrics["single_rmsd"] = float(single_result["rmsd"])
-                sample_metrics["single_tm_score"] = float(single_result["tm_score"])
-
-            elif loader_name == "ensemble":
-                gt_c4_ens = sample["gt_c4_ensemble"].to(pred_c4.device)
-                ensemble_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, eval_mask.to(pred_c4.device))
+                sample_metrics["rmsd"] = float(single_result["rmsd"])
+                sample_metrics["tm_score"] = float(single_result["tm_score"])
+            else:  # "ensemble"
+                gt_c4_ens = sample["gt_c4_ensemble"].to(pred_c4.device)  # [K, L, 3]
+                ensemble_result = metrics.compute_ensemble_metrics(
+                    pred_c4, gt_c4_ens, eval_mask.to(pred_c4.device)
+                )
                 sample_metrics.update(ensemble_result)
 
             batch_metrics.append(sample_metrics)
@@ -547,7 +560,7 @@ class FlowModule(LightningModule):
                 batch["single_embedding"].dtype
             )                                                          # [B, N]
             nu_raw = self.flexibility_net(
-                batch["single_embedding"], seq_mask
+                batch["single_embedding"], batch["pair_embedding"], seq_mask
             )  # [B, N]
             # Bridge sampling uses a detached nu so L_bridge does NOT train ψ.
             noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_raw.detach())
@@ -662,8 +675,9 @@ class FlowModule(LightningModule):
 
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        interpolant = Interpolant(self._infer_cfg.interpolant, bridge_cfg=self._bridge_cfg)
-        interpolant.set_device(batch["res_mask"].device)
+        # Reuse self.interpolant (same config as validation) to ensure
+        # identical sampling behaviour.  Only set_device per batch.
+        self.interpolant.set_device(batch["res_mask"].device)
 
         num_batch = batch["is_na_residue_mask"].shape[0]
         c4_idx = nucleotide_constants.atom_order["C4'"]
@@ -697,65 +711,57 @@ class FlowModule(LightningModule):
                 "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
-            if self._level >= 3:
+            # Bridge-consistent stochastic sampler. tau=0 recovers the
+            # deterministic ODE bit-for-bit; tau>0 injects bridge-shaped
+            # Gaussian exploration noise. nu is only queried for Level 3
+            # checkpoints (flexibility_net present) and when tau>0; otherwise
+            # we fall back to nu_i ≡ 1 (homoscedastic Level-2 sampler).
+            interp_cfg = getattr(self._infer_cfg, "interpolant", None)
+            tau = float(getattr(interp_cfg, "tau", 0.0)) if interp_cfg is not None else 0.0
+            nu = None
+            if self.flexibility_net is not None and tau > 0.0:
+                flex_seq_mask = torch.ones(
+                    num_generated,
+                    num_res,
+                    device=context["single_embedding"].device,
+                )
                 with torch.no_grad():
-                    single_bn = na_single.unsqueeze(0)                       # [1, num_res, D]
-                    mask_bn = torch.ones(1, num_res, device=single_bn.device)
-                    nu_sample = self.flexibility_net(single_bn, mask_bn)     # [1, num_res]
-                    nu_sample = nu_sample.expand(num_generated, -1).contiguous()
-                atom37_traj, _, _ = interpolant.sample_bridge(
-                    num_generated, num_res, self.model, context=context, nu=nu_sample,
-                )
-            elif self._level >= 2:
-                atom37_traj, _, _ = interpolant.sample_bridge(
-                    num_generated, num_res, self.model, context=context,
-                )
-            else:
-                atom37_traj, _, _ = interpolant.sample(
-                    num_generated, num_res, self.model, context=context
-                )
+                    nu = self.flexibility_net(
+                        context["single_embedding"],
+                        context["pair_embedding"],
+                        flex_seq_mask,
+                    ).detach()
+            atom37_traj, _, _ = self.interpolant.sample(
+                num_generated, num_res, self.model, context=context,
+                tau=tau, nu=nu,
+            )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]  # [num_generated, num_res, 3]
 
-            # Write PDB files
-            is_na = np.ones(num_res, dtype=np.int64)
-            for j in range(num_generated):
-                au.write_complex_to_pdbs(
-                    du.to_numpy(atom37_traj[-1][j:j+1])[0],
-                    os.path.join(sample_dir, f"{cluster_id}_conf{j+1}"),
-                    is_na_residue_mask=is_na,
-                )
+            # Write structure files (CIF or PDB)
+            output_format = getattr(self, "_output_format", "pdb")
+            na_aatype = du.to_numpy(sample["aatype"][na_mask]) if "aatype" in sample else None
 
-            # GT C4' coords (strip padding with na_mask)
-            gt_torsions = sample["torsion_angles_sin_cos"][na_mask][:, :8, :].reshape(1, -1, 16)
-            gt_atoms = rna_all_atom.to_atom37_rna(
-                sample["trans_1"][na_mask].unsqueeze(0),
-                sample["rotmats_1"][na_mask].unsqueeze(0),
-                eval_mask.unsqueeze(0),
-                torsions=gt_torsions,
-            )
-            gt_c4 = gt_atoms[:, :, c4_idx]  # [1, num_res, 3]
+            if output_format == "cif":
+                for j in range(num_generated):
+                    au.write_complex_to_cif(
+                        du.to_numpy(atom37_traj[-1][j:j+1])[0],
+                        os.path.join(sample_dir, f"{cluster_id}_conf{j+1}"),
+                        aatype=na_aatype,
+                    )
+            else:
+                is_na = np.ones(num_res, dtype=np.int64)
+                for j in range(num_generated):
+                    au.write_complex_to_pdbs(
+                        du.to_numpy(atom37_traj[-1][j:j+1])[0],
+                        os.path.join(sample_dir, f"{cluster_id}_conf{j+1}"),
+                        is_na_residue_mask=is_na,
+                    )
 
-            # Single metrics (best RMSD/TM across all generated)
-            single_result = metrics.compute_single_metrics(
-                pred_c4, gt_c4, eval_mask.unsqueeze(0)
-            )
-
-            out_row = {
+            outputs.append({
                 "cluster_id": cluster_id,
-                "pdb_name": pdb_name,
                 "length": num_res,
-                "rmsd": float(single_result["rmsd"]),
-                "tm_score": float(single_result["tm_score"]),
+                "num_generated": num_generated,
                 "sample_dir": sample_dir,
-            }
-
-            # Ensemble metrics
-            if ensemble_enabled and num_generated >= 2:
-                gt_c4_ens = sample.get("gt_c4_ensemble", None)
-                if gt_c4_ens is not None:
-                    ens_result = metrics.compute_ensemble_metrics(pred_c4, gt_c4_ens, eval_mask)
-                    out_row.update(ens_result)
-
-            outputs.append(out_row)
+            })
 
         return outputs

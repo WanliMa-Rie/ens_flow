@@ -4,10 +4,11 @@ Offline dataset builder that processes raw PDB files into preprocessed conformer
 
 Returns:
     train_conformers.pt: List[Dict[str, Any]],
-    val_ensemble_conformers.pt: List[Dict[str, Any]],
-    val_single_conformers.pt: List[Dict[str, Any]],
     test_ensemble_conformers.pt: List[Dict[str, Any]],
     test_single_conformers.pt: List[Dict[str, Any]],
+
+Note: split_cdhit80.json no longer carries a dedicated validation split —
+validation runs on the test splits, so only train / test_* are built here.
 """
 
 import argparse
@@ -356,16 +357,12 @@ def main():
     payload = json.loads(cluster_split_path.read_text())
     splits = {
         "train": list(payload.get("train", [])),
-        "val_ensemble": list(payload.get("val_ensemble", [])),
-        "val_single": list(payload.get("val_single", [])),
         "test_ensemble": list(payload.get("test_ensemble", [])),
         "test_single": list(payload.get("test_single", [])),
     }
 
     for split_name in (
         "train",
-        "val_ensemble",
-        "val_single",
         "test_ensemble",
         "test_single",
     ):

@@ -103,9 +103,13 @@ MSE residual. A two-stage training protocol is supported via
   losses (warm-start after a Level 2 pretrain).
 - `full`: joint training with the stop-grad routing above.
 
-**Inference.** `sample_bridge` computes $\nu$ once per sample from the
-`single_embedding` and runs per-residue Euler–Maruyama with
-$\bar\sigma\sqrt{\nu_i}$ as the diffusion amplitude.
+**Inference.** `Interpolant.sample(..., tau, nu)` runs a bridge-consistent
+Euler–Maruyama sampler. At $\tau=0$ it reduces bit-for-bit to the
+deterministic ODE; at $\tau>0$ it injects Gaussian exploration noise with
+envelope $\alpha_i(t) = \tau\sqrt{\nu_i}\sqrt{t(1-t)}$ that matches the
+training bridge variance per unit time. Level 3 checkpoints query the
+`FlexibilityNet` once per sample to produce $\nu_i(s)$; earlier levels pass
+`nu=None` (homoscedastic, $\nu_i\equiv 1$).
 
 Full derivation, the identifiability argument, strict nesting conditions, and
 data-side B-factor gating details are in `docs/architecture_report.md §3`.
@@ -196,7 +200,7 @@ ens_flow/
 │       └── utils.py                  # PDB writing, alignment
 ├── train_se3_flows.py                # Training entry point
 ├── inference_se3_flows.py            # Inference script
-├── eval_se3_flows.py                 # Evaluation script
+├── evaluate_metrics.py               # Evaluation script
 └── pyproject.toml
 ```
 
