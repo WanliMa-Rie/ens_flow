@@ -702,10 +702,14 @@ class FlowModule(LightningModule):
                 "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
-            # Sampler is selected by self._level inside Interpolant.sample:
-            # level 1 → ODE, level >= 2 → bridge-consistent SDE.
-            # nu is queried only for Level 3 checkpoints; Level 2 falls back
-            # to nu_i ≡ 1 (homoscedastic).
+            # Sampler selection: by default driven by self._level inside
+            # Interpolant.sample (level 1 → ODE, level >= 2 → SDE); set
+            # `inference.interpolant.use_sde: false/true` to force-override
+            # (e.g. run an L2 checkpoint through ODE for ablation).
+            interp_cfg = getattr(self._infer_cfg, "interpolant", None)
+            use_sde_cfg = getattr(interp_cfg, "use_sde", None) if interp_cfg else None
+            use_sde = None if use_sde_cfg is None else bool(use_sde_cfg)
+
             nu = None
             if self.flexibility_net is not None:
                 flex_seq_mask = torch.ones(
@@ -720,7 +724,8 @@ class FlowModule(LightningModule):
                         flex_seq_mask,
                     ).detach()
             atom37_traj, _, _ = self.interpolant.sample(
-                num_generated, num_res, self.model, context=context, nu=nu,
+                num_generated, num_res, self.model, context=context,
+                nu=nu, use_sde=use_sde,
             )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]  # [num_generated, num_res, 3]
 

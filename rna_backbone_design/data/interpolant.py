@@ -358,7 +358,7 @@ class Interpolant:
 
         return trans_new, rotmats_new
 
-    def sample(self, num_batch, num_res, model, context=None, nu=None):
+    def sample(self, num_batch, num_res, model, context=None, nu=None, use_sde=None):
         """
         Params:
             num_batch : number of independent samples
@@ -369,17 +369,20 @@ class Interpolant:
                 multiplier from the Level-3 FlexibilityNet. Already mean-1
                 normalized per sample. ``None`` (Level 2 or no head) falls
                 back to ``nu_i ≡ 1`` (homoscedastic bridge SDE).
-
-        Sampler is selected by ``self._level``:
-            - ``level == 1``: deterministic ODE (no noise injection).
-            - ``level >= 2``: bridge-consistent Euler-Maruyama with
-              variance per unit time matched to training.
+            use_sde: optional sampler override. ``None`` → auto from level
+                (level 1 → ODE, level >= 2 → SDE). ``True``/``False`` force
+                the choice; ``True`` at level 1 is invalid and raises.
 
         Returns:
             Generated backbone samples in the ATOM37 format
         """
 
-        use_sde = self._level >= 2
+        if use_sde is None:
+            use_sde = self._level >= 2
+        if use_sde and self._level < 2:
+            raise ValueError(
+                "SDE sampling requires level >= 2 (bridge config must be present)."
+            )
         if nu is not None:
             nu = nu.to(self._device)
 

@@ -116,6 +116,21 @@ class Sampler:
         # inference.yaml (inference settings + data_cfg overrides) on top.
         cfg = OmegaConf.merge(ckpt_cfg, cfg)
 
+        # Architecture fields must match the checkpoint's saved weights.
+        # Without this, the runtime config.yaml's current defaults (pulled
+        # in via inference.yaml's `defaults: [- config]`) silently shadow the
+        # ckpt's training-time settings and make `load_state_dict` fail with
+        # missing/unexpected keys (e.g. L2 ckpt + current `level: 3` default
+        # → tries to load a non-existent flexibility_net).
+        if "model" in ckpt_cfg:
+            cfg.model = ckpt_cfg.model
+        ckpt_bridge = OmegaConf.select(ckpt_cfg, "stochastic_bridge")
+        if ckpt_bridge is not None:
+            if "level" in ckpt_bridge:
+                cfg.stochastic_bridge.level = ckpt_bridge.level
+            if "flexibility" in ckpt_bridge:
+                cfg.stochastic_bridge.flexibility = ckpt_bridge.flexibility
+
         cfg.experiment.checkpointer.dirpath = "./"
 
         self._cfg = cfg
