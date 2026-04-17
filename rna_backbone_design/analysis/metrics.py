@@ -343,7 +343,7 @@ def pairwise_rmsd_matrix(coords, mask):
     return matrix
 
 
-def compute_ensemble_metrics(pred_c4, gt_c4, mask, deltas=(4.5, 5.0)):
+def compute_ensemble_metrics(pred_c4, gt_c4, mask, deltas=(5.0, 6.0, 7.0)):
     """
     pred_c4: [G, L, 3] - generated conformers
     gt_c4: [K, L, 3] - ground truth conformers

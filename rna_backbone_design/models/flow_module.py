@@ -57,7 +57,6 @@ class FlowModule(LightningModule):
         # Linear), so Level 3 starts byte-identical to Level 2.
         self.flexibility_net = None
         self._bfactor_cfg = None
-        self._training_phase = None
         if self._level >= 3:
             flex_cfg = self._bridge_cfg.flexibility
             self.flexibility_net = FlexibilityNet(
@@ -68,12 +67,6 @@ class FlowModule(LightningModule):
                 eps=float(flex_cfg.eps),
             )
             self._bfactor_cfg = self._bridge_cfg.bfactor
-            self._training_phase = str(self._bridge_cfg.training_phase)
-            if self._training_phase not in ("full", "psi_only"):
-                raise ValueError(
-                    f"Unknown stochastic_bridge.training_phase: {self._training_phase}. "
-                    f"Expected one of: 'full', 'psi_only'."
-                )
 
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
@@ -364,11 +357,25 @@ class FlowModule(LightningModule):
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
 
-            # All levels use ODE inference (§2.8): the SFM-trained velocity
-            # field already encodes bridge stochasticity; diversity comes
-            # from different initial (x_0, R_0) samples.
+            # Level 3: query FlexibilityNet so the bridge SDE uses per-residue
+            # nu. Mirror the training contract: nu is mean-1 normalized over
+            # the resolved mask (eval_mask here).
+            nu = None
+            if self.flexibility_net is not None:
+                flex_mask = (
+                    eval_mask.to(context["single_embedding"].dtype)
+                    .unsqueeze(0)
+                    .repeat(num_generated, 1)
+                )
+                with torch.no_grad():
+                    nu = self.flexibility_net(
+                        context["single_embedding"],
+                        context["pair_embedding"],
+                        flex_mask,
+                    ).detach()
+
             atom37_traj, _, _ = self.interpolant.sample(
-                num_generated, num_res, self.model, context=context
+                num_generated, num_res, self.model, context=context, nu=nu,
             )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]
 
@@ -441,7 +448,8 @@ class FlowModule(LightningModule):
         L_B = per-sample mean of (log nu_validB_i - log b_hat_i)^2 on the
               valid-B residue set, averaged over samples that pass the
               sample-level gate. The valid-B set requires (a) the residue is
-              resolved, (b) ``b_i > min_valid_bfactor``, AND the sample passes
+              resolved, (b) ``b_i > 0`` (drops unresolved positions, which
+              the data pipeline writes as 0), AND the sample passes
               (c) ``|valid-B| >= 2``, (d) ``mean(b_valid) > 0``, AND
               (e) ``std(b_valid) > min_std_bfactor``. The std gate (e) drops
               uniform-positive samples (e.g. cryo-EM with refined-but-uniform
@@ -450,17 +458,13 @@ class FlowModule(LightningModule):
 
               Inside the loss, ``nu`` is *re-normalized over the valid-B mask*
               before comparison: ``nu_validB_i = nu_i / mean_{j in valid}
-              nu_j``. The bridge corruption still uses the sequence-normalized
+              nu_j``. The bridge corruption uses the resolved-mask-normalized
               nu from the head; the dual normalization is purely a loss-internal
-              operation. Under the constant-kappa assumption AND the centered
-              translation bridge, the relation ``nu_validB_i = b_hat_i`` holds
-              **asymptotically** in m_R with an O(1/m_R) multiplicative
-              correction whose coefficient size is bounded by ~3.4% on the
-              dataset's length distribution and is below the noise floor of
-              crystallographic B-factors. The L_B form below is therefore the
-              asymptotic surrogate of an exactly anchored target. See
-              architecture_report.md §3.5 and the EnsFlow paper Appendix C
-              ("Centered-bridge B-factor proxy") for the full derivation.
+              operation. Under the constant-kappa assumption, the relation
+              ``nu_validB_i = b_hat_i`` holds **asymptotically** in m_R with an
+              O(1/m_R) multiplicative correction below the noise floor of
+              crystallographic B-factors. See architecture_report.md §3.5
+              for the full derivation.
 
         L_nu = batch-pooled mean over resolved residues of (log nu_i)^2.
                A weak log-space regularizer.
@@ -473,7 +477,6 @@ class FlowModule(LightningModule):
         Returns:
             (L_B, L_nu, n_valid_samples)
         """
-        min_b = float(self._bfactor_cfg.min_valid_bfactor)
         min_std = float(getattr(self._bfactor_cfg, "min_std_bfactor", 0.5))
 
         # log(nu) with a small clamp for numerical safety. Used by L_nu only;
@@ -487,7 +490,7 @@ class FlowModule(LightningModule):
 
         # --- L_B : sample-level validity gating + per-residue valid-B mask ---
         # Per-residue validity: resolved AND b_factor > min_valid.
-        valid = (res_mask > 0.5) & (b_factors > min_b)
+        valid = (res_mask > 0.5) & (b_factors > 0.0)
         valid_f = valid.to(b_factors.dtype)
         n_valid_per_sample = valid_f.sum(dim=-1)                    # [B]
         n_safe = n_valid_per_sample.clamp(min=1.0)                  # [B]
@@ -550,17 +553,14 @@ class FlowModule(LightningModule):
         nu_raw = None
         if self._level >= 3:
             # Forward the flex head *with* gradients so L_B / L_nu can train ψ.
-            # IMPORTANT: nu is normalized over the *sequence mask* (positions
-            # where single_embedding is a real nucleotide, padding excluded),
-            # NOT over res_mask (which is the resolved-structure subset).
-            # Validation and predict_step already use a sequence-only mask after
-            # stripping padding via is_na_residue_mask, so this keeps the head's
-            # normalization contract identical across train/val/predict.
-            seq_mask = batch["is_na_residue_mask"].to(
-                batch["single_embedding"].dtype
-            )                                                          # [B, N]
+            # nu is normalized over res_mask (resolved residues). This matches
+            # validation/inference, where every input position is a residue we
+            # actually generate (no unresolved subset there), so the head's
+            # mean-1 normalization domain is consistent across train/val/predict.
             nu_raw = self.flexibility_net(
-                batch["single_embedding"], batch["pair_embedding"], seq_mask
+                batch["single_embedding"],
+                batch["pair_embedding"],
+                batch["res_mask"].to(batch["single_embedding"].dtype),
             )  # [B, N]
             # Bridge sampling uses a detached nu so L_bridge does NOT train ψ.
             noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_raw.detach())
@@ -655,20 +655,11 @@ class FlowModule(LightningModule):
         return train_loss
 
     def configure_optimizers(self):
-        # Level 1 / Level 2: just the FlowModel (no flex head).
-        # Level 3 full:      FlowModel + FlexibilityNet, joint optimization.
-        # Level 3 psi_only:  freeze FlowModel, optimize only FlexibilityNet
-        #                    (warm-start stage after a Level 2 pretrain).
         if self._level >= 3:
-            if self._training_phase == "psi_only":
-                for p in self.model.parameters():
-                    p.requires_grad_(False)
-                params = [p for p in self.flexibility_net.parameters() if p.requires_grad]
-            else:  # "full"
-                params = (
-                    list(self.model.parameters())
-                    + list(self.flexibility_net.parameters())
-                )
+            params = (
+                list(self.model.parameters())
+                + list(self.flexibility_net.parameters())
+            )
         else:
             params = list(self.model.parameters())
         return torch.optim.AdamW(params=params, **self._exp_cfg.optimizer)
@@ -711,15 +702,12 @@ class FlowModule(LightningModule):
                 "single_embedding": na_single.unsqueeze(0).repeat(num_generated, 1, 1),
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
-            # Bridge-consistent stochastic sampler. tau=0 recovers the
-            # deterministic ODE bit-for-bit; tau>0 injects bridge-shaped
-            # Gaussian exploration noise. nu is only queried for Level 3
-            # checkpoints (flexibility_net present) and when tau>0; otherwise
-            # we fall back to nu_i ≡ 1 (homoscedastic Level-2 sampler).
-            interp_cfg = getattr(self._infer_cfg, "interpolant", None)
-            tau = float(getattr(interp_cfg, "tau", 0.0)) if interp_cfg is not None else 0.0
+            # Sampler is selected by self._level inside Interpolant.sample:
+            # level 1 → ODE, level >= 2 → bridge-consistent SDE.
+            # nu is queried only for Level 3 checkpoints; Level 2 falls back
+            # to nu_i ≡ 1 (homoscedastic).
             nu = None
-            if self.flexibility_net is not None and tau > 0.0:
+            if self.flexibility_net is not None:
                 flex_seq_mask = torch.ones(
                     num_generated,
                     num_res,
@@ -732,8 +720,7 @@ class FlowModule(LightningModule):
                         flex_seq_mask,
                     ).detach()
             atom37_traj, _, _ = self.interpolant.sample(
-                num_generated, num_res, self.model, context=context,
-                tau=tau, nu=nu,
+                num_generated, num_res, self.model, context=context, nu=nu,
             )
             pred_c4 = atom37_traj[-1][:, :, c4_idx]  # [num_generated, num_res, 3]
 

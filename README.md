@@ -97,19 +97,14 @@ discourages runaway concentration.
 $\mathcal{L}_{\text{bridge}}$ updates only the `FlowModel` and
 $\mathcal{L}_B + \lambda_\nu\mathcal{L}_\nu$ updates only the `FlexibilityNet`.
 This prevents the velocity loss from silently shrinking $\nu$ to reduce the
-MSE residual. A two-stage training protocol is supported via
-`stochastic_bridge.training_phase`:
-- `psi_only`: freeze `FlowModel`, train only `FlexibilityNet` on the B-factor
-  losses (warm-start after a Level 2 pretrain).
-- `full`: joint training with the stop-grad routing above.
+MSE residual. Training is single-stage joint optimization — both modules go
+into the same AdamW group, no phase switching.
 
-**Inference.** `Interpolant.sample(..., tau, nu)` runs a bridge-consistent
-Euler–Maruyama sampler. At $\tau=0$ it reduces bit-for-bit to the
-deterministic ODE; at $\tau>0$ it injects Gaussian exploration noise with
-envelope $\alpha_i(t) = \tau\sqrt{\nu_i}\sqrt{t(1-t)}$ that matches the
-training bridge variance per unit time. Level 3 checkpoints query the
-`FlexibilityNet` once per sample to produce $\nu_i(s)$; earlier levels pass
-`nu=None` (homoscedastic, $\nu_i\equiv 1$).
+**Inference.** Sampler is selected by `level`: Level 1 runs the deterministic
+ODE; Level 2 / Level 3 run a bridge-consistent Euler–Maruyama with diffusion
+envelope $\sqrt{\nu_i}\sqrt{t(1-t)}$ matched to the training bridge per unit
+time. Level 3 queries the `FlexibilityNet` once per sample to produce
+$\nu_i(s)$; Level 2 passes `nu=None` (homoscedastic, $\nu_i\equiv 1$).
 
 Full derivation, the identifiability argument, strict nesting conditions, and
 data-side B-factor gating details are in `docs/architecture_report.md §3`.
@@ -144,7 +139,7 @@ Three levels are selected by a single field in `configs/config.yaml`:
 
 ```yaml
 stochastic_bridge:
-  level: 2                   # 1, 2, or 3
+  level: 3                   # 1, 2, or 3
 
   # Used at Levels 2 and 3 (the global bridge scale).
   bridge:
@@ -154,14 +149,16 @@ stochastic_bridge:
   # Level 3 only.
   flexibility:
     hidden_dim: 128
+    n_heads: 4
     eps: 1.0e-4
   bfactor:
     enabled: true
     lambda_b: 1.0
-    lambda_nu: 0.01
-    min_valid_bfactor: 0.0   # residues with b ≤ this are dropped from L_B
-  training_phase: full       # "full" or "psi_only"
+    lambda_nu: 0.1
 ```
+
+L_B drops unresolved residues automatically (the data pipeline writes
+`b_factors == 0` there); no extra threshold parameter needed.
 
 See `configs/config.yaml` for the full schema (data paths, model dims, optimizer,
 checkpointer).
@@ -224,8 +221,8 @@ in the config. Key knobs:
 | `experiment.training.translation_loss_weight` | 2.0 | |
 | `experiment.training.aux_loss_t_pass` | 0.25 | Auxiliary-loss time gate |
 
-Level 3 additionally reads `stochastic_bridge.bfactor.lambda_b`,
-`lambda_nu`, and `training_phase`.
+Level 3 additionally reads `stochastic_bridge.bfactor.lambda_b` and
+`lambda_nu`.
 
 ## Inference
 
@@ -233,9 +230,10 @@ Level 3 additionally reads `stochastic_bridge.bfactor.lambda_b`,
 python inference_se3_flows.py
 ```
 
-Level 1 runs Euler ODE; Levels 2 and 3 run Euler–Maruyama. Level 3 computes
-`ν` from the `single_embedding` once per sample and uses it in the per-residue
-diffusion amplitudes.
+Level 1 runs Euler ODE; Levels 2 and 3 run the bridge-consistent
+Euler–Maruyama sampler. At Level 3, `ν` is computed from the
+`(single, pair)` embeddings once per sample and modulates the per-residue
+diffusion amplitudes through $\bar\sigma\sqrt{\nu_i}\sqrt{t(1-t)}$.
 
 ## Evaluation Metrics
 

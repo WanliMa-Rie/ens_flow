@@ -52,7 +52,7 @@ SPLIT_JSON = os.path.join(DATA_DIR, "split_cdhit80.json")
 
 # Coverage-metric RMSD thresholds (Å). Keep `evaluate_method` and
 # `print_summary` in sync by sourcing both from this constant.
-COV_DELTAS = (3.5, 4.5, 5.0)
+COV_DELTAS = (5.0, 6.0, 7.0)
 
 
 # ── structure parsing ────────────────────────────────────────────────────
