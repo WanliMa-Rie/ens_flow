@@ -30,6 +30,24 @@ from rna_backbone_design.data import vocabulary
 from rna_backbone_design.data.rigid_utils import Rigid
 
 
+def _compact_atom_idx(atom_name: str) -> int:
+    """Return the residue-independent compact-23 atom index for RNA/DNA atoms."""
+    indices = {
+        order[atom_name]
+        for order in nc.restype_name_to_compact_atom_order.values()
+        if atom_name in order
+    }
+    if len(indices) != 1:
+        raise ValueError(
+            f"Expected a unique compact atom index for {atom_name}, got {indices}"
+        )
+    return next(iter(indices))
+
+
+def _compact_atom_indices(atom_names: List[str]) -> List[int]:
+    return [_compact_atom_idx(atom_name) for atom_name in atom_names]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Build preprocessed datasets directly from PDB files.",
@@ -166,9 +184,9 @@ def align_structure_to_full_sequence(
             atom_deoxy[idx] = True
 
     # Center around backbone (C4') using only solved residues
-    c4_idx = nc.atom_order["C4'"]
-    bb_mask = atom_mask[:, c4_idx]
-    bb_pos = atom_positions[:, c4_idx]
+    c4_compact_idx = _compact_atom_idx("C4'")
+    bb_mask = atom_mask[:, c4_compact_idx]
+    bb_pos = atom_positions[:, c4_compact_idx]
     bb_center = np.sum(bb_pos, axis=0) / (np.sum(bb_mask) + 1e-5)
     atom_positions = atom_positions - bb_center[None, None, :]
     atom_positions = atom_positions * atom_mask[..., None]
@@ -199,7 +217,8 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     atom_b_factors = torch.as_tensor(processed_feats["atom_b_factors"]).float()
 
     num_res = int(aatype.shape[0])
-    c4_idx = int(nc.atom_order["C4'"])
+    c4_atom27_idx = int(nc.atom_order["C4'"])
+    rigid_compact_idx = _compact_atom_indices(["C3'", "C4'", "O4'"])
     bb_atom_idx = [
         int(nc.atom_order["C3'"]),
         int(nc.atom_order["C4'"]),
@@ -235,19 +254,25 @@ def processed_to_geometry(processed_feats: Dict[str, Any]) -> Dict[str, torch.Te
     # Extract named-atom coords from atom27 positions (correct atom_order indexing).
     atom27_pos = na_feats["all_atom_positions"].float()
     atom27_mask = na_feats["all_atom_mask"].float()
-    res_mask = (atom27_mask[:, c4_idx] > 0.5).int()
-    c4_coords = atom27_pos[:, c4_idx]
+    res_mask = (atom27_mask[:, c4_atom27_idx] > 0.5).int()
+    c4_coords = atom27_pos[:, c4_atom27_idx]
     bb_coords = atom27_pos[:, bb_atom_idx]
 
     torsion_angles_sin_cos = na_feats["torsion_angles_sin_cos"][:, :8].float()
     torsion_angles_mask = na_feats["torsion_angles_mask"][:, :8].float()
 
-    # Per-residue B-factor from C4' atom (backward compat)
-    b_factors = atom_b_factors[:, c4_idx]
-
     # Atom-wise B-factors and mask in compact 23-atom format
     atom_b_factors_compact = atom_b_factors[:, :num_na_atoms].float()
     atom_mask_compact = atom_mask[:, :num_na_atoms].float()
+
+    # Per-residue B-factor target: average over the three atoms defining the
+    # rigid frame (C3', C4', O4') in compact-23 atom order.
+    rigid_b_factors = atom_b_factors_compact[:, rigid_compact_idx]
+    rigid_b_mask = atom_mask_compact[:, rigid_compact_idx]
+    b_factors = (
+        (rigid_b_factors * rigid_b_mask).sum(dim=-1)
+        / rigid_b_mask.sum(dim=-1).clamp(min=1.0)
+    )
 
     # Normalize unsolved positions: zero geometry, identity rotation
     unsolved = (res_mask == 0)

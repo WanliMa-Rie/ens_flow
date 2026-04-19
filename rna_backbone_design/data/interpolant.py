@@ -366,9 +366,10 @@ class Interpolant:
             model : the parameterised vector field (ie, the "denoiser")
             context: dict containing conditioning information (single_embedding, pair_embedding)
             nu : optional ``[num_batch, num_res]`` per-residue flexibility
-                multiplier from the Level-3 FlexibilityNet. Already mean-1
-                normalized per sample. ``None`` (Level 2 or no head) falls
-                back to ``nu_i ≡ 1`` (homoscedastic bridge SDE).
+                multiplier from the Level-3 FlexibilityNet on absolute scale
+                (nu>1 = more dynamic than dataset average, nu<1 = more rigid).
+                ``None`` (Level 2 or no head) falls back to ``nu_i ≡ 1``
+                (homoscedastic bridge SDE).
             use_sde: optional sampler override. ``None`` → auto from level
                 (level 1 → ODE, level >= 2 → SDE). ``True``/``False`` force
                 the choice; ``True`` at level 1 is invalid and raises.
@@ -401,6 +402,9 @@ class Interpolant:
         if context is not None:
             batch["single_embedding"] = context["single_embedding"]
             batch["pair_embedding"] = context["pair_embedding"]
+
+        if nu is not None:
+            batch["nu"] = nu
 
         # get diffusion timesteps in order between [0, 1]
         ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)

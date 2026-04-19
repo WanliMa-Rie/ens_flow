@@ -10,6 +10,24 @@ from torch import nn
 from rna_backbone_design.models import utils
 
 
+class NuFiLM(nn.Module):
+    """log(nu) -> (gamma, beta) FiLM. Zero-init weight + bias = identity at start.
+
+    Applied to the projected single embedding so the trunk sees the per-residue
+    noise level. log(nu)=0 (i.e. dataset-average flexibility) maps to no modulation.
+    """
+
+    def __init__(self, c_out: int):
+        super().__init__()
+        self.proj = nn.Linear(1, 2 * c_out)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, log_nu: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.proj(log_nu.unsqueeze(-1)).chunk(2, dim=-1)
+        return (1.0 + gamma) * x + beta
+
+
 class NodeEmbedder(nn.Module):
     def __init__(self, module_cfg):
         super(NodeEmbedder, self).__init__()
@@ -24,6 +42,8 @@ class NodeEmbedder(nn.Module):
             nn.Linear(self.c_single_in, self.c_s, bias=False),
         )
 
+        self.nu_film = NuFiLM(self.c_s)
+
         self.linear = nn.Linear(
             self._cfg.c_pos_emb + self._cfg.c_timestep_emb + self.c_s, self.c_s
         )
@@ -34,24 +54,19 @@ class NodeEmbedder(nn.Module):
         )[:, None, :].repeat(1, mask.shape[1], 1)
         return timestep_emb * mask.unsqueeze(-1)
 
-    def forward(self, timesteps, mask, single_embedding):
-        # s: [b]
-
+    def forward(self, timesteps, mask, single_embedding, nu=None):
         b, num_res, device = mask.shape[0], mask.shape[1], mask.device
 
-        # [b, n_res, c_pos_emb]
         pos = torch.arange(num_res, dtype=torch.float32).to(device)[None]
         pos_emb = utils.get_index_embedding(pos, self.c_pos_emb, max_len=2056)
         pos_emb = pos_emb.repeat([b, 1, 1])
         pos_emb = pos_emb * mask.unsqueeze(-1)
 
-        # [b, n_res, c_s]
         single_emb = self.single_embedder(single_embedding)
         single_emb = single_emb * mask.unsqueeze(-1)
+        if nu is not None:
+            log_nu = torch.log(nu.clamp(min=1e-8))
+            single_emb = self.nu_film(log_nu, single_emb) * mask.unsqueeze(-1)
 
-        # [b, n_res, c_timestep_emb]
-        input_feats = [pos_emb]
-        # timesteps are between 0 and 1. Convert to integers.
-        input_feats.append(self.embed_t(timesteps, mask))
-        input_feats.append(single_emb)
+        input_feats = [pos_emb, self.embed_t(timesteps, mask), single_emb]
         return self.linear(torch.cat(input_feats, dim=-1))

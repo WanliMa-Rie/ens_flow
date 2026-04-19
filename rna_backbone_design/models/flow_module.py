@@ -38,23 +38,13 @@ class FlowModule(LightningModule):
         self._model_cfg = cfg.model
         self._interpolant_cfg = cfg.interpolant
 
-        # Set-up vector field prediction model
         self.model = FlowModel(cfg.model)
 
-        # Stochastic bridge configuration
-        #   Level 1: deterministic SE(3) flow matching.
-        #   Level 2: tangent-space-lifted SE(3) stochastic bridge (fixed sigma).
-        #   Level 3: bridge + per-residue flexibility head with B-factor supervision.
         self._bridge_cfg = getattr(cfg, 'stochastic_bridge', None)
         self._level = int(self._bridge_cfg.level) if self._bridge_cfg is not None else 1
 
-        # Set-up interpolant — Level 2/3 read sigma from self._bridge_cfg.bridge,
-        # Level 1 ignores the bridge config entirely.
         self.interpolant = Interpolant(cfg.interpolant, bridge_cfg=self._bridge_cfg)
 
-        # Level 3 components: pair-biased FlexibilityNet + B-factor loss cfg.
-        # At initialization nu_i ≡ 1 (zero-weight + log(e-1) bias on the final
-        # Linear), so Level 3 starts byte-identical to Level 2.
         self.flexibility_net = None
         self._bfactor_cfg = None
         if self._level >= 3:
@@ -64,7 +54,6 @@ class FlowModule(LightningModule):
                 c_pair_in=int(cfg.model.edge_features.c_pair_in),
                 hidden_dim=int(flex_cfg.hidden_dim),
                 n_heads=int(flex_cfg.n_heads),
-                eps=float(flex_cfg.eps),
             )
             self._bfactor_cfg = self._bridge_cfg.bfactor
 
@@ -309,6 +298,49 @@ class FlowModule(LightningModule):
         }
         return batch_losses
 
+    def _compute_bfactor_metrics(self, nu, res_mask, b_factors):
+        """Validation metrics comparing predicted absolute B to observed B."""
+        if self._bfactor_cfg is None:
+            return {}
+
+        b_global_mean = float(self._bfactor_cfg.global_mean_b)
+        min_valid_b = float(self._bfactor_cfg.min_valid_b)
+        valid = (res_mask > 0.5) & (b_factors > min_valid_b)
+        if int(valid.sum().item()) == 0:
+            nan = float("nan")
+            return {
+                "bfactor_mae": nan,
+                "bfactor_rmse": nan,
+                "bfactor_log_mae": nan,
+                "bfactor_log_rmse": nan,
+                "bfactor_corr": nan,
+            }
+
+        true_b = b_factors[valid].to(nu.dtype)
+        pred_b = (nu[valid] * b_global_mean).to(nu.dtype)
+
+        err = pred_b - true_b
+        log_err = (
+            torch.log(nu[valid].clamp(min=1e-8))
+            - torch.log((true_b / b_global_mean).clamp(min=1e-8))
+        )
+
+        corr = torch.tensor(float("nan"), device=nu.device, dtype=nu.dtype)
+        if true_b.numel() >= 2:
+            true_centered = true_b - true_b.mean()
+            pred_centered = pred_b - pred_b.mean()
+            denom = true_centered.norm() * pred_centered.norm()
+            if float(denom.item()) > 1e-8:
+                corr = (true_centered * pred_centered).sum() / denom
+
+        return {
+            "bfactor_mae": float(err.abs().mean().detach().cpu()),
+            "bfactor_rmse": float(torch.sqrt((err ** 2).mean()).detach().cpu()),
+            "bfactor_log_mae": float(log_err.abs().mean().detach().cpu()),
+            "bfactor_log_rmse": float(torch.sqrt((log_err ** 2).mean()).detach().cpu()),
+            "bfactor_corr": float(corr.detach().cpu()),
+        }
+
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
         """Per-cluster validation.
 
@@ -357,22 +389,19 @@ class FlowModule(LightningModule):
                 "pair_embedding": na_pair.unsqueeze(0).repeat(num_generated, 1, 1, 1),
             }
 
-            # Level 3: query FlexibilityNet so the bridge SDE uses per-residue
-            # nu. Mirror the training contract: nu is mean-1 normalized over
-            # the resolved mask (eval_mask here).
+            # Level 3: query FlexibilityNet once on the un-replicated input,
+            # then broadcast to num_generated. Mask = resolved (matches
+            # training; unresolved positions get nu=1 via head's padding rule).
             nu = None
+            nu_one = None
             if self.flexibility_net is not None:
-                flex_mask = (
-                    eval_mask.to(context["single_embedding"].dtype)
-                    .unsqueeze(0)
-                    .repeat(num_generated, 1)
-                )
                 with torch.no_grad():
-                    nu = self.flexibility_net(
-                        context["single_embedding"],
-                        context["pair_embedding"],
-                        flex_mask,
-                    ).detach()
+                    nu_one = self.flexibility_net(
+                        na_single.unsqueeze(0),
+                        na_pair.unsqueeze(0),
+                        eval_mask.unsqueeze(0).to(na_single.dtype),
+                    )
+                nu = nu_one.expand(num_generated, -1).contiguous()
 
             atom37_traj, _, _ = self.interpolant.sample(
                 num_generated, num_res, self.model, context=context, nu=nu,
@@ -380,6 +409,14 @@ class FlowModule(LightningModule):
             pred_c4 = atom37_traj[-1][:, :, c4_idx]
 
             sample_metrics = {}
+            if nu_one is not None and "b_factors" in sample:
+                sample_metrics.update(
+                    self._compute_bfactor_metrics(
+                        nu_one.squeeze(0),
+                        eval_mask.to(nu_one.device),
+                        sample["b_factors"][na_mask].to(nu_one.device),
+                    )
+                )
 
             if loader_name == "single":
                 gt_c4 = sample["c4_coords"][na_mask].unsqueeze(0).to(pred_c4.device)  # [1, L, 3]
@@ -442,128 +479,51 @@ class FlowModule(LightningModule):
             rank_zero_only=rank_zero_only,
         )
 
-    def _compute_flex_losses(self, nu, res_mask, b_factors):
-        """Level 3: B-factor alignment + log-space regularizer.
+    def _compute_flex_losses(self, nu, res_mask, b_factors, b_global_mean, min_valid_b):
+        """Level 3 B-factor losses on absolute scale.
 
-        L_B = per-sample mean of (log nu_validB_i - log b_hat_i)^2 on the
-              valid-B residue set, averaged over samples that pass the
-              sample-level gate. The valid-B set requires (a) the residue is
-              resolved, (b) ``b_i > 0`` (drops unresolved positions, which
-              the data pipeline writes as 0), AND the sample passes
-              (c) ``|valid-B| >= 2``, (d) ``mean(b_valid) > 0``, AND
-              (e) ``std(b_valid) > min_std_bfactor``. The std gate (e) drops
-              uniform-positive samples (e.g. cryo-EM with refined-but-uniform
-              B-factors) that would otherwise dilute supervision toward
-              ``nu -> 1``.
-
-              Inside the loss, ``nu`` is *re-normalized over the valid-B mask*
-              before comparison: ``nu_validB_i = nu_i / mean_{j in valid}
-              nu_j``. The bridge corruption uses the resolved-mask-normalized
-              nu from the head; the dual normalization is purely a loss-internal
-              operation. Under the constant-kappa assumption, the relation
-              ``nu_validB_i = b_hat_i`` holds **asymptotically** in m_R with an
-              O(1/m_R) multiplicative correction below the noise floor of
-              crystallographic B-factors. See architecture_report.md §3.5
-              for the full derivation.
-
-        L_nu = batch-pooled mean over resolved residues of (log nu_i)^2.
-               A weak log-space regularizer.
-
-        Args:
-            nu: ``[B, N]`` per-residue flexibility (undetached path to ψ).
-            res_mask: ``[B, N]`` 0/1 residue mask (resolved).
-            b_factors: ``[B, N]`` raw per-residue B-factors from PDB.
-
-        Returns:
-            (L_B, L_nu, n_valid_samples)
+        L_B  = mean of (log nu_i - log(b_i / B_global))^2 on valid-B residues.
+        L_nu = mean of (log nu_i)^2 over resolved residues. Pulls nu -> 1.
+        Valid-B = resolved AND b_i > min_valid_b (drops near-zero artifacts that
+        would dominate L_B in log space).
         """
-        min_std = float(getattr(self._bfactor_cfg, "min_std_bfactor", 0.5))
-
-        # log(nu) with a small clamp for numerical safety. Used by L_nu only;
-        # L_B uses a re-normalized log_nu_validB computed below.
         log_nu = torch.log(nu.clamp(min=1e-8))
 
-        # --- L_nu : batch-pooled log-space regularizer over resolved residues ---
         res_mask_f = res_mask.to(nu.dtype)
         n_res = res_mask_f.sum().clamp(min=1.0)
         L_nu = (log_nu ** 2 * res_mask_f).sum() / n_res
 
-        # --- L_B : sample-level validity gating + per-residue valid-B mask ---
-        # Per-residue validity: resolved AND b_factor > min_valid.
-        valid = (res_mask > 0.5) & (b_factors > 0.0)
+        valid = (res_mask > 0.5) & (b_factors > min_valid_b)
         valid_f = valid.to(b_factors.dtype)
-        n_valid_per_sample = valid_f.sum(dim=-1)                    # [B]
-        n_safe = n_valid_per_sample.clamp(min=1.0)                  # [B]
+        n_valid_per_sample = valid_f.sum(dim=-1)
+        n_safe = n_valid_per_sample.clamp(min=1.0)
 
-        # Per-sample mean B (over valid residues).
-        b_masked = b_factors * valid_f
-        b_mean = b_masked.sum(dim=-1) / n_safe                      # [B]
+        log_b_hat = torch.log((b_factors / b_global_mean).clamp(min=1e-8))
+        diff2 = (log_nu - log_b_hat) ** 2
+        per_sample = (diff2 * valid_f).sum(dim=-1) / n_safe
+        good_f = (n_valid_per_sample >= 1).to(per_sample.dtype)
+        L_B = (per_sample * good_f).sum() / good_f.sum().clamp(min=1.0)
 
-        # Per-sample variance for the std gate. Var = E[X^2] - E[X]^2 over the
-        # valid-B mask.
-        b_sq_masked = (b_factors ** 2) * valid_f
-        b_sq_mean = b_sq_masked.sum(dim=-1) / n_safe                # [B]
-        b_var = (b_sq_mean - b_mean ** 2).clamp(min=0.0)            # [B]
-        b_std = torch.sqrt(b_var + 1e-12)                            # [B]
-
-        # Sample-level gate: at least 2 valid + nonzero mean + nonzero std.
-        # The std gate rules out uniform-positive samples that would supervise
-        # nu -> 1 and dilute the per-residue signal.
-        good = (n_valid_per_sample >= 2) & (b_mean > 0) & (b_std > min_std)
-
-        # Re-normalize nu over the valid-B mask for the loss comparison so that
-        # the asymptotic identity nu_validB_i = b_hat_i holds (modulo the
-        # O(1/m_R) correction documented in Appendix C of the paper). Bad
-        # samples are masked out below via `good_f`, so a div-by-zero clamp on
-        # nu_mean_validB is purely defensive.
-        nu_masked = nu * valid_f
-        nu_mean_validB = nu_masked.sum(dim=-1) / n_safe              # [B]
-        nu_validB = nu / nu_mean_validB.clamp(min=1e-8)[:, None]     # [B, N]
-        log_nu_validB = torch.log(nu_validB.clamp(min=1e-8))         # [B, N]
-
-        # b_hat_i = b_i / b_mean over the valid-B mask. Clamp b_mean to avoid
-        # div-by-zero (bad samples are masked via `good`).
-        b_hat = b_factors / b_mean.clamp(min=1e-8)[:, None]          # [B, N]
-        log_b_hat = torch.log(b_hat.clamp(min=1e-8))                 # [B, N]
-
-        diff2 = (log_nu_validB - log_b_hat) ** 2                     # [B, N]
-        per_sample = (diff2 * valid_f).sum(dim=-1) / n_safe          # [B]
-        good_f = good.to(per_sample.dtype)
-        n_good = good_f.sum().clamp(min=1.0)
-        L_B = (per_sample * good_f).sum() / n_good
-
-        return L_B, L_nu, int(good.sum().item())
+        return L_B, L_nu, int(valid_f.sum().item())
 
     def training_step(self, batch):
-        """
-        Performs one iteration of SE(3) flow matching and returns total training loss
-        using the core and auxiliary losses computed in `model_step`.
+        """One iteration of SE(3) flow matching.
 
-        - Level 1: deterministic SE(3) flow matching.
-        - Level 2: tangent-space-lifted SE(3) stochastic bridge with fixed
-          (sigma_x, sigma_omega). Exact same loss as Level 1; only the
-          corruption injects BB noise.
-        - Level 3: Level 2 + per-residue flexibility multiplier nu_i from the
-          sequence-only FlexibilityNet. L_bridge backprops only into FlowModel
-          (nu is detached before entering the bridge); L_B + L_nu backprop only
-          into FlexibilityNet. This gradient routing is explicit below.
+        Level 3 gradient routing: nu enters the bridge detached so L_bridge
+        only updates FlowModel; L_B + L_nu only update FlexibilityNet.
         """
         self.interpolant.set_device(batch["res_mask"].device)
 
         nu_raw = None
         if self._level >= 3:
-            # Forward the flex head *with* gradients so L_B / L_nu can train ψ.
-            # nu is normalized over res_mask (resolved residues). This matches
-            # validation/inference, where every input position is a residue we
-            # actually generate (no unresolved subset there), so the head's
-            # mean-1 normalization domain is consistent across train/val/predict.
             nu_raw = self.flexibility_net(
                 batch["single_embedding"],
                 batch["pair_embedding"],
                 batch["res_mask"].to(batch["single_embedding"].dtype),
-            )  # [B, N]
-            # Bridge sampling uses a detached nu so L_bridge does NOT train ψ.
-            noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_raw.detach())
+            )
+            nu_det = nu_raw.detach()
+            noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_det)
+            noisy_batch["nu"] = nu_det
         else:
             noisy_batch = self.interpolant.corrupt_batch(batch)
 
@@ -590,15 +550,13 @@ class FlowModule(LightningModule):
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
 
-        # --- Level 3 extras ---
         if self._level >= 3 and bool(self._bfactor_cfg.enabled):
-            if "b_factors" not in batch:
-                raise KeyError(
-                    "Level 3 requires 'b_factors' in the batch (provided by "
-                    "the data pipeline). Check build_datasets.py / collate."
-                )
-            L_B, L_nu, n_good = self._compute_flex_losses(
-                nu_raw, batch["res_mask"], batch["b_factors"]
+            L_B, L_nu, n_valid_res = self._compute_flex_losses(
+                nu_raw,
+                batch["res_mask"],
+                batch["b_factors"],
+                float(self._bfactor_cfg.global_mean_b),
+                float(self._bfactor_cfg.min_valid_b),
             )
             lam_b = float(self._bfactor_cfg.lambda_b)
             lam_nu = float(self._bfactor_cfg.lambda_nu)
@@ -611,11 +569,10 @@ class FlowModule(LightningModule):
                     batch_size=num_batch,
                 )
             self._log_scalar(
-                "train/n_valid_bfactor_samples", float(n_good),
+                "train/n_valid_bfactor_residues", float(n_valid_res),
                 on_step=False, on_epoch=True, prog_bar=False,
                 batch_size=num_batch,
             )
-            # Log a few nu statistics for debugging
             with torch.no_grad():
                 mask_f = batch["res_mask"].to(nu_raw.dtype)
                 nu_sum = (nu_raw * mask_f).sum()
@@ -710,19 +667,17 @@ class FlowModule(LightningModule):
             use_sde_cfg = getattr(interp_cfg, "use_sde", None) if interp_cfg else None
             use_sde = None if use_sde_cfg is None else bool(use_sde_cfg)
 
+            # Inference has no "unresolved" concept: mask = all-ones, head
+            # predicts nu for every position. Compute once, broadcast.
             nu = None
             if self.flexibility_net is not None:
-                flex_seq_mask = torch.ones(
-                    num_generated,
-                    num_res,
-                    device=context["single_embedding"].device,
-                )
                 with torch.no_grad():
-                    nu = self.flexibility_net(
-                        context["single_embedding"],
-                        context["pair_embedding"],
-                        flex_seq_mask,
-                    ).detach()
+                    nu_one = self.flexibility_net(
+                        na_single.unsqueeze(0),
+                        na_pair.unsqueeze(0),
+                        torch.ones(1, num_res, device=na_single.device, dtype=na_single.dtype),
+                    )
+                nu = nu_one.expand(num_generated, -1).contiguous()
             atom37_traj, _, _ = self.interpolant.sample(
                 num_generated, num_res, self.model, context=context,
                 nu=nu, use_sde=use_sde,

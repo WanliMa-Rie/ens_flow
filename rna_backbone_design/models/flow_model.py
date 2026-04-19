@@ -95,9 +95,11 @@ class FlowModel(nn.Module):
 
         single_embedding = input_feats["single_embedding"]
         pair_embedding = input_feats["pair_embedding"]
+        nu = input_feats.get("nu", None)
 
-        # Initialize node and edge embeddings
-        init_node_embed = self.node_embedder(continuous_t, node_mask, single_embedding)
+        init_node_embed = self.node_embedder(
+            continuous_t, node_mask, single_embedding, nu=nu,
+        )
         init_node_embed = init_node_embed * node_mask[..., None]
         node_embed = init_node_embed * node_mask[..., None]
 
