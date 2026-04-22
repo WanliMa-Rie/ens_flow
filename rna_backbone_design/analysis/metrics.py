@@ -11,6 +11,8 @@ from torch import Tensor
 from rna_backbone_design.data import nucleotide_constants
 from rna_backbone_design.data import all_atom as rna_all_atom
 
+KabschResult = namedtuple("KabschResult", ["rot_mats", "trans_vecs"])
+
 def exists(x: object) -> bool:
     return x is not None
 
@@ -170,7 +172,7 @@ def kabsch(
     rot_mats = U @ flip_mat @ Vt  # [B, 3, 3]
     trans_vecs = fixed_com.squeeze(1) - einsum(rot_mats, mobile_com.squeeze(1), "B i j, B j -> B i")  # [B, 3]
 
-    return namedtuple("KabschResult", ["rot_mats", "trans_vecs"])(rot_mats, trans_vecs)
+    return KabschResult(rot_mats, trans_vecs)
 
 
 def rototranslate(
@@ -385,6 +387,206 @@ def compute_ensemble_metrics(pred_c4, gt_c4, mask, deltas=(5.0, 6.0, 7.0)):
 
     return result
 
+
+def per_residue_variance(pred_c4: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    """Per-residue positional variance across an aligned ensemble.
+
+    All G conformers are Kabsch-aligned to conformer 0, then
+        σ²_i = (1/G) Σ_g ‖x_{g,i} − x̄_i‖²    ∈ ℝ,  x̄_i = (1/G) Σ_g x_{g,i}.
+    The result has shape [L]. Residues outside `mask` still receive a value
+    (alignment is mask-aware, variance is computed for all residues).
+    """
+    G, L, _ = pred_c4.shape
+    if G < 2:
+        return torch.zeros(L, device=pred_c4.device, dtype=pred_c4.dtype)
+    if mask is not None and mask.dim() == 1:
+        mask = mask.unsqueeze(0)
+    ref = pred_c4[0:1].expand(G, -1, -1)                       # [G, L, 3]
+    align_mask = mask.expand(G, -1) if mask is not None else None
+    try:
+        aligned = superimpose(ref, pred_c4, align_mask)        # [G, L, 3]
+    except RuntimeError:
+        aligned = pred_c4
+    mean_pos = aligned.mean(dim=0, keepdim=True)                # [1, L, 3]
+    return (aligned - mean_pos).pow(2).sum(dim=-1).mean(dim=0)  # [L]
+
+
+def _rankdata_avg(x: Tensor) -> Tensor:
+    """Average-rank (ties get the mean of their block), like scipy.rankdata."""
+    order = torch.argsort(x, stable=True)
+    n = x.numel()
+    ranks = torch.empty(n, dtype=torch.float64, device=x.device)
+    ranks[order] = torch.arange(1, n + 1, dtype=torch.float64, device=x.device)
+    sorted_x = x[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sorted_x[j] == sorted_x[i]:
+            j += 1
+        if j > i + 1:
+            ranks[order[i:j]] = ranks[order[i:j]].mean()
+        i = j
+    return ranks
+
+
+def spearman_rho(x: Tensor, y: Tensor) -> float:
+    if x.numel() < 2:
+        return float("nan")
+    rx = _rankdata_avg(x.flatten().double())
+    ry = _rankdata_avg(y.flatten().double())
+    rx -= rx.mean()
+    ry -= ry.mean()
+    den = torch.sqrt(rx.pow(2).sum() * ry.pow(2).sum())
+    if den.item() == 0.0:
+        return float("nan")
+    return float((rx * ry).sum() / den)
+
+
+def local_rmsf(
+    coords: Tensor,
+    window: int = 6,
+    n_ref: int = 5,
+    seed: int = 0,
+) -> Tensor:
+    """Per-residue *local* RMSF in the Viliuga et al. (2025) sense.
+
+    For each residue i we locally Kabsch-align a window W_i = {i-S/2..i+S/2}
+    to a reference conformer and measure how far residue i has moved. This
+    removes the "a distal loop wiggle makes the whole helix look flexible"
+    artefact of global RMSF.
+
+    Args:
+        coords: [N, L, 3] — N conformers (aligned or unaligned).
+        window: S — number of neighbours used for the local alignment.
+        n_ref:  number of reference conformers; per-residue RMSF is the
+                median across references (reduces reference-choice bias).
+        seed:   RNG seed for picking reference conformers.
+
+    Returns:
+        xi: [L] per-residue local RMSF in Å. Boundary residues with <3
+            valid neighbours (can't do Kabsch) get 0.
+    """
+    N, L, _ = coords.shape
+    if N < 2:
+        return torch.zeros(L, device=coords.device, dtype=coords.dtype)
+    half = window // 2
+    n_ref = min(n_ref, N)
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    ref_idx = torch.randperm(N, generator=g)[:n_ref].tolist()
+
+    # For every residue i, build the window indices once.
+    windows = [
+        list(range(max(0, i - half), min(L, i + half + 1)))
+        for i in range(L)
+    ]
+
+    xi_per_ref = torch.zeros(n_ref, L, device=coords.device, dtype=coords.dtype)
+    for r, ref in enumerate(ref_idx):
+        ref_coords = coords[ref]                           # [L, 3]
+        for i, idxs in enumerate(windows):
+            if len(idxs) < 3:                              # not enough points for Kabsch
+                continue
+            idxs_t = torch.tensor(idxs, device=coords.device)
+            # Stack windows across all N conformers in one Kabsch call:
+            fixed = ref_coords[idxs_t].unsqueeze(0).expand(N, -1, -1)   # [N, |W|, 3]
+            mobile = coords[:, idxs_t]                                    # [N, |W|, 3]
+            try:
+                aligned = superimpose(fixed, mobile)                      # [N, |W|, 3]
+            except RuntimeError:
+                continue
+            # Position of residue i within the window:
+            local_i = idxs.index(i)
+            disp = (aligned[:, local_i] - ref_coords[i]).pow(2).sum(-1)   # [N]
+            xi_per_ref[r, i] = disp.mean().sqrt()
+    # median over references (Viliuga §2.2): robust to reference choice.
+    return xi_per_ref.median(dim=0).values                                # [L]
+
+
+def compute_flex_profile_metrics(
+    xi_pred: Tensor,
+    xi_ref: Tensor,
+    mask: Optional[Tensor] = None,
+    prefix: str = "flex",
+) -> dict:
+    """Pearson r / Spearman ρ / MAE / composite score between two per-residue
+    flexibility profiles, aggregated over the masked residues.
+
+    Viliuga et al. (2025) §4.1 report r, MAE, and a combined score
+        s = w_r · r − w_mae · MAE,
+    with w_r = 1, w_mae = 2. r captures profile *shape*; MAE captures
+    *amplitude* in physical units (both profiles in Å).
+
+    Returns keys `{prefix}_pearson`, `{prefix}_spearman`, `{prefix}_mae`,
+    `{prefix}_score`, `{prefix}_amp_ratio`.
+    """
+    xi_pred = xi_pred.flatten().float()
+    xi_ref = xi_ref.flatten().float()
+    if mask is None:
+        sel = torch.ones_like(xi_pred, dtype=torch.bool)
+    else:
+        sel = mask.flatten().bool()
+    sel = sel & torch.isfinite(xi_pred) & torch.isfinite(xi_ref)
+    # Drop residues with zero reference (unsolved in anchor B-factor convention).
+    sel = sel & (xi_ref > 0)
+    if int(sel.sum().item()) < 3:
+        nan = float("nan")
+        return {
+            f"{prefix}_pearson": nan, f"{prefix}_spearman": nan,
+            f"{prefix}_mae": nan, f"{prefix}_score": nan,
+            f"{prefix}_amp_ratio": nan,
+        }
+
+    xp = xi_pred[sel]
+    xr = xi_ref[sel]
+
+    # Pearson
+    xp_c = xp - xp.mean()
+    xr_c = xr - xr.mean()
+    den = torch.sqrt(xp_c.pow(2).sum() * xr_c.pow(2).sum())
+    pearson = float((xp_c * xr_c).sum() / den) if den.item() > 0 else float("nan")
+
+    spearman = spearman_rho(xp, xr)
+
+    mae = float((xp - xr).abs().mean())
+    amp_ratio = float(xp.mean() / xr.mean()) if xr.mean().item() > 0 else float("nan")
+
+    score = (pearson - 2.0 * mae) if (pearson == pearson) else float("nan")  # NaN guard
+
+    return {
+        f"{prefix}_pearson": pearson,
+        f"{prefix}_spearman": spearman,
+        f"{prefix}_mae": mae,
+        f"{prefix}_score": score,
+        f"{prefix}_amp_ratio": amp_ratio,
+    }
+
+
+def compute_flexibility_b_correlation(
+    pred_c4: Tensor, b_factors: Tensor, mask: Optional[Tensor] = None
+) -> dict:
+    """ρ(σ̂²_i, B_i): Spearman correlation between per-residue ensemble
+    variance from the generated conformers and GT crystallographic B-factors.
+
+    Tests whether the generated samples are consistent with physical
+    flexibility (Table 2 of the paper).
+
+    pred_c4: [G, L, 3] generated conformers
+    b_factors: [L] per-residue B-factor (0 marks unsolved — dropped here)
+    mask: [L] residue mask
+    """
+    sigma_sq = per_residue_variance(pred_c4, mask)      # [L]
+    b = b_factors.flatten().float().to(sigma_sq.device)  # [L]
+
+    sel = mask.flatten().bool() if mask is not None else torch.ones_like(b, dtype=torch.bool)
+    sel = sel & (b > 0) & torch.isfinite(sigma_sq) & torch.isfinite(b)
+    if int(sel.sum().item()) < 3:
+        return {"rho_sigma_b": float("nan"), "sigma_sq_mean": float("nan")}
+
+    return {
+        "rho_sigma_b": spearman_rho(sigma_sq[sel], b[sel]),
+        "sigma_sq_mean": float(sigma_sq[sel].mean().item()),
+    }
 
 
 def calc_rna_c4_c4_metrics(c4_pos, bond_tol=0.1, clash_tol=1.0):

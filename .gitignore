@@ -21,6 +21,8 @@ refine-logs/**
 configs/**
 eval_out/**
 FoldFlow-main/**
+evaluation/**
+.claude
 rna_backbone_design/data/tests/**
 # Byte-compiled / optimized / DLL files
 __pycache__/

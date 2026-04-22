@@ -136,6 +136,8 @@ class Sampler:
         self._cfg = cfg
         self._infer_cfg = cfg.inference
         self._rng = np.random.default_rng(self._infer_cfg.seed)
+        self._nu_mode = str(getattr(self._infer_cfg, "nu_mode", "pred"))
+        self._save_nu_inputs = bool(getattr(self._infer_cfg, "save_nu_inputs", False))
 
         # Determine level from config (old ckpts may lack stochastic_bridge)
         bridge_cfg = OmegaConf.select(cfg, "stochastic_bridge", default=None)
@@ -152,6 +154,12 @@ class Sampler:
         )
         os.makedirs(self._output_dir, exist_ok=True)
         log.info(f"Saving results to {self._output_dir}")
+        log.info(
+            "Inference settings: level=%s, nu_mode=%s, save_nu_inputs=%s",
+            self._level,
+            self._nu_mode,
+            self._save_nu_inputs,
+        )
 
         # Save merged config for reproducibility
         with open(os.path.join(self._output_dir, "inference_config.yaml"), "w") as f:
@@ -159,7 +167,7 @@ class Sampler:
 
         # Read checkpoint and initialize module.
         self._flow_module = FlowModule.load_from_checkpoint(
-            checkpoint_path=ckpt_path, cfg=cfg, map_location="cpu", weights_only=False
+            checkpoint_path=ckpt_path, cfg=cfg, map_location="cpu", weights_only=False, strict=False
         )
 
         self._flow_module.eval()
