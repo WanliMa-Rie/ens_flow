@@ -50,12 +50,14 @@ class FlowModule(LightningModule):
         if self._level >= 3:
             flex_cfg = self._bridge_cfg.flexibility
             self.flexibility_net = FlexibilityNet(
-                c_single_in=int(cfg.model.node_features.c_single_in),
                 c_pair_in=int(cfg.model.edge_features.c_pair_in),
                 hidden_dim=int(flex_cfg.hidden_dim),
-                n_heads=int(flex_cfg.n_heads),
+                dropout=float(flex_cfg.dropout),
             )
             self._bfactor_cfg = self._bridge_cfg.bfactor
+            # Two-optimizer setup keeps L_B on its own gradient / clip budget
+            # so B-factor learning isn't throttled by FlowModel's global clip.
+            self.automatic_optimization = False
 
         self._sample_write_dir = self._exp_cfg.checkpointer.dirpath
         os.makedirs(self._sample_write_dir, exist_ok=True)
@@ -166,8 +168,9 @@ class FlowModule(LightningModule):
 
         # Timestep used for normalization.
         t = noisy_batch["t"]
+        t_normalize_clip = t.new_tensor(float(training_cfg.t_normalize_clip))
         norm_scale = 1 - torch.min(
-            t[..., None], torch.tensor(training_cfg.t_normalize_clip)
+            t[..., None], t_normalize_clip
         )
 
         # Model output predictions.
@@ -199,13 +202,6 @@ class FlowModule(LightningModule):
             )
             / loss_denom
         )
-
-        # SFM correction: add bridge_noise / (2t) to velocity targets (Level >= 2).
-        # Applied AFTER auxiliary losses (bb_atom, dist_mat) which use clean targets.
-        if "trans_bridge_noise" in noisy_batch:
-            sfm_scale = 1.0 / (2.0 * noisy_batch["t"].clamp(min=1e-4))  # [B, 1]
-            gt_trans_1 = gt_trans_1 + noisy_batch["trans_bridge_noise"] * sfm_scale[..., None]
-            gt_rot_vf = gt_rot_vf + noisy_batch["rot_bridge_noise"] * sfm_scale[..., None]
 
         # Translation VF loss
         trans_error = (
@@ -298,47 +294,50 @@ class FlowModule(LightningModule):
         }
         return batch_losses
 
+    def _compute_bfactor_norm_log_mae(
+        self,
+        nu,
+        res_mask,
+        b_factors,
+        min_valid_b,
+    ):
+        """Mean |log(nu_i) - log(B_i / mean_chain_B)| on valid-B residues."""
+        if nu.ndim == 1:
+            nu = nu.unsqueeze(0)
+            res_mask = res_mask.unsqueeze(0)
+            b_factors = b_factors.unsqueeze(0)
+
+        valid = (res_mask > 0.5) & (b_factors > min_valid_b)
+        valid_f = valid.to(nu.dtype)
+        n_valid_per_sample = valid_f.sum(dim=-1)
+        if int(n_valid_per_sample.sum().item()) == 0:
+            return torch.tensor(float("nan"), device=nu.device, dtype=nu.dtype)
+
+        n_safe = n_valid_per_sample.clamp(min=1.0)
+        b_factors = b_factors.to(nu.dtype)
+        b_mean = (b_factors * valid_f).sum(dim=-1) / n_safe
+        log_nu = torch.log(nu.clamp(min=1e-8))
+        log_b_norm = torch.log(
+            (b_factors / b_mean.clamp(min=1e-8)[:, None]).clamp(min=1e-8)
+        )
+        abs_err = (log_nu - log_b_norm).abs()
+        per_sample = (abs_err * valid_f).sum(dim=-1) / n_safe
+        good_f = (n_valid_per_sample >= 1).to(nu.dtype)
+        return (per_sample * good_f).sum() / good_f.sum().clamp(min=1.0)
+
     def _compute_bfactor_metrics(self, nu, res_mask, b_factors):
-        """Validation metrics comparing predicted absolute B to observed B."""
+        """Validation metric for normalized B-factor agreement."""
         if self._bfactor_cfg is None:
             return {}
 
-        b_global_mean = float(self._bfactor_cfg.global_mean_b)
-        min_valid_b = float(self._bfactor_cfg.min_valid_b)
-        valid = (res_mask > 0.5) & (b_factors > min_valid_b)
-        if int(valid.sum().item()) == 0:
-            nan = float("nan")
-            return {
-                "bfactor_mae": nan,
-                "bfactor_rmse": nan,
-                "bfactor_log_mae": nan,
-                "bfactor_log_rmse": nan,
-                "bfactor_corr": nan,
-            }
-
-        true_b = b_factors[valid].to(nu.dtype)
-        pred_b = (nu[valid] * b_global_mean).to(nu.dtype)
-
-        err = pred_b - true_b
-        log_err = (
-            torch.log(nu[valid].clamp(min=1e-8))
-            - torch.log((true_b / b_global_mean).clamp(min=1e-8))
+        bfactor_norm_log_mae = self._compute_bfactor_norm_log_mae(
+            nu,
+            res_mask,
+            b_factors,
+            float(self._bfactor_cfg.min_valid_b),
         )
-
-        corr = torch.tensor(float("nan"), device=nu.device, dtype=nu.dtype)
-        if true_b.numel() >= 2:
-            true_centered = true_b - true_b.mean()
-            pred_centered = pred_b - pred_b.mean()
-            denom = true_centered.norm() * pred_centered.norm()
-            if float(denom.item()) > 1e-8:
-                corr = (true_centered * pred_centered).sum() / denom
-
         return {
-            "bfactor_mae": float(err.abs().mean().detach().cpu()),
-            "bfactor_rmse": float(torch.sqrt((err ** 2).mean()).detach().cpu()),
-            "bfactor_log_mae": float(log_err.abs().mean().detach().cpu()),
-            "bfactor_log_rmse": float(torch.sqrt((log_err ** 2).mean()).detach().cpu()),
-            "bfactor_corr": float(corr.detach().cpu()),
+            "bfactor_norm_log_mae": float(bfactor_norm_log_mae.detach().cpu()),
         }
 
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
@@ -397,9 +396,8 @@ class FlowModule(LightningModule):
             if self.flexibility_net is not None:
                 with torch.no_grad():
                     nu_one = self.flexibility_net(
-                        na_single.unsqueeze(0),
                         na_pair.unsqueeze(0),
-                        eval_mask.unsqueeze(0).to(na_single.dtype),
+                        eval_mask.unsqueeze(0).to(na_pair.dtype),
                     )
                 nu = nu_one.expand(num_generated, -1).contiguous()
 
@@ -409,7 +407,7 @@ class FlowModule(LightningModule):
             pred_c4 = atom37_traj[-1][:, :, c4_idx]
 
             sample_metrics = {}
-            if nu_one is not None and "b_factors" in sample:
+            if loader_name == "single" and nu_one is not None and "b_factors" in sample:
                 sample_metrics.update(
                     self._compute_bfactor_metrics(
                         nu_one.squeeze(0),
@@ -479,32 +477,33 @@ class FlowModule(LightningModule):
             rank_zero_only=rank_zero_only,
         )
 
-    def _compute_flex_losses(self, nu, res_mask, b_factors, b_global_mean, min_valid_b):
-        """Level 3 B-factor losses on absolute scale.
+    def _compute_flex_losses(self, nu, res_mask, b_factors, min_valid_b):
+        """Level 3 B-factor loss on per-chain normalized B-factor scale.
 
-        L_B  = mean of (log nu_i - log(b_i / B_global))^2 on valid-B residues.
-        L_nu = mean of (log nu_i)^2 over resolved residues. Pulls nu -> 1.
+        L_B = mean of (log nu_i - log(b_i / mean_chain_B))^2 on valid-B residues.
         Valid-B = resolved AND b_i > min_valid_b (drops near-zero artifacts that
         would dominate L_B in log space).
         """
         log_nu = torch.log(nu.clamp(min=1e-8))
-
-        res_mask_f = res_mask.to(nu.dtype)
-        n_res = res_mask_f.sum().clamp(min=1.0)
-        L_nu = (log_nu ** 2 * res_mask_f).sum() / n_res
 
         valid = (res_mask > 0.5) & (b_factors > min_valid_b)
         valid_f = valid.to(b_factors.dtype)
         n_valid_per_sample = valid_f.sum(dim=-1)
         n_safe = n_valid_per_sample.clamp(min=1.0)
 
-        log_b_hat = torch.log((b_factors / b_global_mean).clamp(min=1e-8))
+        b_mean = (b_factors * valid_f).sum(dim=-1) / n_safe
+        log_b_hat = torch.log(
+            (b_factors / b_mean.clamp(min=1e-8)[:, None]).clamp(min=1e-8)
+        )
+        # Clamp target to [-2, 2] (nu_target in [0.14, 7.4]) so a single
+        # crystallographic outlier cannot drag nu to absurd scales.
+        log_b_hat = log_b_hat.clamp(min=-2.0, max=2.0)
         diff2 = (log_nu - log_b_hat) ** 2
         per_sample = (diff2 * valid_f).sum(dim=-1) / n_safe
         good_f = (n_valid_per_sample >= 1).to(per_sample.dtype)
         L_B = (per_sample * good_f).sum() / good_f.sum().clamp(min=1.0)
 
-        return L_B, L_nu, int(valid_f.sum().item())
+        return L_B, int(valid_f.sum().item())
 
     def training_step(self, batch):
         """One iteration of SE(3) flow matching.
@@ -514,18 +513,33 @@ class FlowModule(LightningModule):
         """
         self.interpolant.set_device(batch["res_mask"].device)
 
+        sigma_scale = 1.0
+        if self._level >= 2:
+            b_cfg = self._bridge_cfg.bridge
+            ws = int(getattr(b_cfg, "warmup_start_step", 0))
+            we = int(getattr(b_cfg, "warmup_end_step", 0))
+            step = int(self.global_step)
+            if we > ws:
+                sigma_scale = max(0.0, min(1.0, (step - ws) / (we - ws)))
+            self._log_scalar(
+                "train/sigma_scale", float(sigma_scale),
+                on_step=False, on_epoch=True, prog_bar=False,
+                batch_size=int(batch["res_mask"].shape[0]),
+            )
+
+        # Warmup = exact Level 1: flex head stays cold, no L_B, no FiLM, no
+        # per-residue bridge noise. All three turn on together at step >= ws.
         nu_raw = None
-        if self._level >= 3:
+        if self._level >= 3 and sigma_scale > 0.0:
             nu_raw = self.flexibility_net(
-                batch["single_embedding"],
                 batch["pair_embedding"],
-                batch["res_mask"].to(batch["single_embedding"].dtype),
+                batch["res_mask"].to(batch["pair_embedding"].dtype),
             )
             nu_det = nu_raw.detach()
-            noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_det)
+            noisy_batch = self.interpolant.corrupt_batch(batch, nu=nu_det, sigma_scale=sigma_scale)
             noisy_batch["nu"] = nu_det
         else:
-            noisy_batch = self.interpolant.corrupt_batch(batch)
+            noisy_batch = self.interpolant.corrupt_batch(batch, sigma_scale=sigma_scale)
 
         if self._interpolant_cfg.self_condition and random.random() > 0.5:
             with torch.no_grad():
@@ -546,53 +560,31 @@ class FlowModule(LightningModule):
                 batch_size=num_batch,
             )
 
-        train_loss = (
+        main_loss = (
             total_losses[self._exp_cfg.training.loss] + total_losses["auxiliary_loss"]
         )
+        flex_loss = None
 
-        if self._level >= 3 and bool(self._bfactor_cfg.enabled):
-            L_B, L_nu, n_valid_res = self._compute_flex_losses(
+        if self._level >= 3 and bool(self._bfactor_cfg.enabled) and nu_raw is not None:
+            min_valid_b = float(self._bfactor_cfg.min_valid_b)
+            L_B, _ = self._compute_flex_losses(
                 nu_raw,
                 batch["res_mask"],
                 batch["b_factors"],
-                float(self._bfactor_cfg.global_mean_b),
-                float(self._bfactor_cfg.min_valid_b),
+                min_valid_b,
             )
             lam_b = float(self._bfactor_cfg.lambda_b)
-            lam_nu = float(self._bfactor_cfg.lambda_nu)
-            train_loss = train_loss + lam_b * L_B + lam_nu * L_nu
-
-            for key, val in (("L_B", L_B), ("L_nu", L_nu)):
-                self._log_scalar(
-                    f"train/{key}", val,
-                    on_step=False, on_epoch=True, prog_bar=False,
-                    batch_size=num_batch,
-                )
+            flex_loss = lam_b * L_B
             self._log_scalar(
-                "train/n_valid_bfactor_residues", float(n_valid_res),
-                on_step=False, on_epoch=True, prog_bar=False,
-                batch_size=num_batch,
-            )
-            with torch.no_grad():
-                mask_f = batch["res_mask"].to(nu_raw.dtype)
-                nu_sum = (nu_raw * mask_f).sum()
-                nu_count = mask_f.sum().clamp(min=1.0)
-                nu_mean = nu_sum / nu_count
-                nu_std = ((((nu_raw - nu_mean) ** 2) * mask_f).sum() / nu_count).sqrt()
-            self._log_scalar(
-                "train/nu_mean", nu_mean,
-                on_step=False, on_epoch=True, prog_bar=False,
-                batch_size=num_batch,
-            )
-            self._log_scalar(
-                "train/nu_std", nu_std,
+                "train/L_B", L_B,
                 on_step=False, on_epoch=True, prog_bar=False,
                 batch_size=num_batch,
             )
 
+        pbar_loss = main_loss if flex_loss is None else (main_loss + flex_loss.detach())
         self.log(
             "pbar/loss",
-            train_loss,
+            pbar_loss,
             on_step=True,
             on_epoch=False,
             prog_bar=True,
@@ -602,24 +594,45 @@ class FlowModule(LightningModule):
         )
         self._log_scalar(
             "train/loss",
-            train_loss,
+            pbar_loss,
             on_step=False,
             on_epoch=True,
             prog_bar=False,
             batch_size=num_batch,
         )
 
-        return train_loss
+        if self.automatic_optimization:
+            return main_loss if flex_loss is None else main_loss + flex_loss
+
+        # Manual optimization (level >= 3): independent backward + clip + step
+        # for FlowModel and FlexibilityNet. Guarantees L_B never trades gradient
+        # budget with L_bridge under the global clip.
+        opts = self.optimizers()
+        opt_main, opt_flex = opts[0], opts[1]
+
+        opt_main.zero_grad()
+        self.manual_backward(main_loss)
+        self.clip_gradients(opt_main, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+        opt_main.step()
+
+        if flex_loss is not None:
+            opt_flex.zero_grad()
+            self.manual_backward(flex_loss)
+            torch.nn.utils.clip_grad_norm_(
+                self.flexibility_net.parameters(), max_norm=1.0, norm_type=2.0,
+            )
+            opt_flex.step()
 
     def configure_optimizers(self):
+        opt_cfg = dict(self._exp_cfg.optimizer)
+        flex_wd = float(opt_cfg.pop("flex_weight_decay", 0.1))
+        main_opt = torch.optim.AdamW(self.model.parameters(), **opt_cfg)
         if self._level >= 3:
-            params = (
-                list(self.model.parameters())
-                + list(self.flexibility_net.parameters())
-            )
-        else:
-            params = list(self.model.parameters())
-        return torch.optim.AdamW(params=params, **self._exp_cfg.optimizer)
+            flex_cfg = dict(opt_cfg)
+            flex_cfg["weight_decay"] = flex_wd
+            flex_opt = torch.optim.AdamW(self.flexibility_net.parameters(), **flex_cfg)
+            return [main_opt, flex_opt]
+        return main_opt
 
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
@@ -673,11 +686,21 @@ class FlowModule(LightningModule):
             if self.flexibility_net is not None:
                 with torch.no_grad():
                     nu_one = self.flexibility_net(
-                        na_single.unsqueeze(0),
                         na_pair.unsqueeze(0),
-                        torch.ones(1, num_res, device=na_single.device, dtype=na_single.dtype),
+                        torch.ones(1, num_res, device=na_pair.device, dtype=na_pair.dtype),
                     )
                 nu = nu_one.expand(num_generated, -1).contiguous()
+
+            if bool(getattr(self._infer_cfg, "dump_nu_only", False)):
+                nu_np = nu_one.squeeze(0).float().cpu().numpy()
+                b_np = du.to_numpy(sample["b_factors"][na_mask]) if "b_factors" in sample else np.full(num_res, np.nan)
+                with open(os.path.join(sample_dir, "nu.csv"), "w") as f:
+                    f.write("residue,nu,b_factor\n")
+                    for i in range(num_res):
+                        f.write(f"{i},{float(nu_np[i]):.6f},{float(b_np[i]):.6f}\n")
+                outputs.append({"cluster_id": cluster_id, "length": num_res, "num_generated": 0})
+                continue
+
             atom37_traj, _, _ = self.interpolant.sample(
                 num_generated, num_res, self.model, context=context,
                 nu=nu, use_sde=use_sde,

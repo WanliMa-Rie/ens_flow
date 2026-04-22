@@ -141,6 +141,10 @@ class Sampler:
         bridge_cfg = OmegaConf.select(cfg, "stochastic_bridge", default=None)
         self._level = int(bridge_cfg.level) if bridge_cfg is not None and "level" in bridge_cfg else 1
 
+        # nu_film was added after L1 training; gate its creation so L1 ckpts
+        # load without missing keys. L>=2 ckpts have it in their state_dict.
+        cfg.model.node_features.use_nu_film = self._level >= 2
+
         # Output directory: /projects/u6bk/wanli/inference_ours/ens_flow{level}/
         default_output = f"/projects/u6bk/wanli/inference_ours/ens_flow{self._level}"
         self._output_dir = str(

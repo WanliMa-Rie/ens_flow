@@ -42,7 +42,8 @@ class NodeEmbedder(nn.Module):
             nn.Linear(self.c_single_in, self.c_s, bias=False),
         )
 
-        self.nu_film = NuFiLM(self.c_s)
+        if getattr(self._cfg, "use_nu_film", True):
+            self.nu_film = NuFiLM(self.c_s)
 
         self.linear = nn.Linear(
             self._cfg.c_pos_emb + self._cfg.c_timestep_emb + self.c_s, self.c_s

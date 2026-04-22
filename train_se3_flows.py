@@ -61,7 +61,7 @@ class Experiment:
         # does not honor.
         bar = TQDMProgressBar(refresh_rate=1)
 
-        ckpt_callback = ModelCheckpoint(
+        best_ckpt = ModelCheckpoint(
             dirpath=ckpt_dir,
             filename="best-{epoch:04d}-{valid/ensemble_amr_recall:.4f}",
             monitor="valid/ensemble_amr_recall",
@@ -71,10 +71,29 @@ class Experiment:
             auto_insert_metric_name=False,
         )
 
+        # Train-step-driven latest ckpt so Modal volume commits (every ~10 min)
+        # always catch a recent state regardless of check_val_every_n_epoch.
+        latest_ckpt = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="latest",
+            every_n_train_steps=1000,
+            save_top_k=1,
+            monitor=None,
+            auto_insert_metric_name=False,
+        )
+
+        # Manual-optimization (level>=3) forbids Trainer-level grad clip; we
+        # clip per-optimizer inside training_step instead. Drop the keys here.
+        trainer_cfg = OmegaConf.to_container(self._exp_cfg.trainer, resolve=True)
+        level = int(getattr(self._cfg.stochastic_bridge, "level", 1))
+        if level >= 3:
+            trainer_cfg.pop("gradient_clip_val", None)
+            trainer_cfg.pop("gradient_clip_algorithm", None)
+
         trainer = Trainer(
-            **self._exp_cfg.trainer,
+            **trainer_cfg,
             logger=logger,
-            callbacks=[bar, ckpt_callback],
+            callbacks=[bar, best_ckpt, latest_ckpt],
             enable_progress_bar=True,
             enable_model_summary=True,
             devices="auto",

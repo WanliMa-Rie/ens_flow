@@ -1,4 +1,3 @@
-import os
 import torch, copy
 from rna_backbone_design.data import so3_utils
 from rna_backbone_design.data import utils as du
@@ -48,20 +47,6 @@ class Interpolant:
         self._sample_cfg = cfg.sampling
         self._bridge_cfg = bridge_cfg
         self._level = int(bridge_cfg.level) if bridge_cfg is not None else 1
-        self._igso3 = None
-
-    @property
-    def igso3(self):
-        if self._igso3 is None:
-            sigma_grid = torch.linspace(0.1, 1.5, 1000)
-            # Cache directory is read from the IGSO3_CACHE_DIR env var so that
-            # Modal (or any other persistent-volume backend) can point it at a
-            # mounted volume and avoid re-computing the ~5-minute IGSO(3) CDF
-            # expansion on every container start. Default `.cache` keeps local
-            # development behaviour unchanged.
-            cache_dir = os.environ.get("IGSO3_CACHE_DIR", ".cache")
-            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=cache_dir)
-        return self._igso3
 
     def set_device(self, device):
         self._device = device
@@ -115,15 +100,13 @@ class Interpolant:
 
     def _corrupt_rotmats(self, rotmats_1, t, res_mask):
         """
-        Returns interpolated "flow" for rotations without optimal transport
+        Returns interpolated "flow" for rotations without optimal transport.
+        R_0 is sampled uniformly on SO(3) (Haar measure) to match the
+        inference-time prior; previously used IGSO(3)(sigma=1.5) centered on
+        R_1, which biased the training prior toward the data.
         """
         num_batch, num_res = res_mask.shape
-        noisy_rotmats = self.igso3.sample(  # sample from IGSO(3)
-            torch.tensor([1.5]), num_batch * num_res
-        ).to(self._device)
-        noisy_rotmats = noisy_rotmats.reshape(num_batch, num_res, 3, 3)
-
-        rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
+        rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
 
         # compute "flow" for rotations using log/exp maps
         rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
@@ -138,27 +121,16 @@ class Interpolant:
     # ---------------------------------------------------------------------
 
     def _sample_rotmats_0(self, rotmats_1, res_mask):
-        """Sample R_0 ~ IGSO(3)(sigma=1.5) * R_1 (identical prior to Level 1).
-
-        Returns:
-            rotmats_0: [B, N, 3, 3] prior rotations in the same frame as `rotmats_1`.
-        """
+        """Sample R_0 ~ Uniform(SO(3)) (Haar), matching the inference prior."""
         num_batch, num_res = res_mask.shape
-        noisy_rotmats = self.igso3.sample(
-            torch.tensor([1.5]), num_batch * num_res
-        ).to(self._device)
-        noisy_rotmats = noisy_rotmats.reshape(num_batch, num_res, 3, 3)
-        return torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
+        return _uniform_so3(num_batch, num_res, self._device)
 
-    def _corrupt_trans_bridge(self, trans_1, t, res_mask, sigma_x, nu=None):
+    def _corrupt_trans_bridge(self, trans_1, t, res_mask, sigma_x, min_sigma_x, nu=None):
         """Euclidean Brownian bridge in translation space.
 
-        Level 2 (nu is None):
-            x_t = (1 - t) x_0 + t x_1 + sigma_x * sqrt(t(1-t)) * eps
-        Level 3 (nu is a [B, N] per-residue flexibility multiplier):
-            x_{i,t} = (1 - t) x_{i,0} + t x_{i,1}
-                      + sigma_x * sqrt(nu_i) * sqrt(t(1-t)) * eps_i
-
+        Envelope (FoldFlow-style floor):
+            std_i(t)^2 = sigma_x^2 * nu_i * t(1-t) + min_sigma_x^2
+        Level 2 uses nu_i = 1. min_sigma_x = 0 recovers the strict bridge.
         Per-residue independent Gaussian noise; no CoM re-centering.
         """
         trans_nm_0 = _centered_gaussian(*res_mask.shape, self._device)
@@ -166,51 +138,41 @@ class Interpolant:
         trans_0 = self._batch_ot(trans_0, trans_1, res_mask)
 
         mean = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1  # [B, N, 3]
-        std = sigma_x * torch.sqrt(t * (1.0 - t) + 1e-8)              # [B, 1]
 
         if nu is None:
-            eta_factor = torch.ones_like(res_mask)                    # [B, N]
+            nu_bn = torch.ones_like(res_mask)                         # [B, N]
         else:
-            eta_factor = torch.sqrt(nu.clamp(min=0.0) + 1e-12)        # [B, N]
+            nu_bn = nu.clamp(min=0.0)                                 # [B, N]
+        var = (sigma_x ** 2) * nu_bn * (t * (1.0 - t)) + (min_sigma_x ** 2)
+        std_bn = torch.sqrt(var + 1e-12)                              # [B, N]
 
-        bridge_noise = (
-            std[..., None] * eta_factor[..., None] * torch.randn_like(mean)
-        )                                                             # [B, N, 3]
-        trans_t = mean + bridge_noise
-
+        trans_t = mean + std_bn[..., None] * torch.randn_like(mean)
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
-        return trans_t * res_mask[..., None], bridge_noise * res_mask[..., None]
+        return trans_t * res_mask[..., None]
 
-    def _corrupt_rotmats_bridge(self, rotmats_1, t, res_mask, sigma_omega, nu=None):
+    def _corrupt_rotmats_bridge(self, rotmats_1, t, res_mask, sigma_omega, min_sigma_omega, nu=None):
         """Tangent-space-lifted Brownian bridge on SO(3).
 
-        Level 2:
-            Omega_t = t * omega + sigma_omega * sqrt(t(1-t)) * eps
-        Level 3 (nu is a [B, N] per-residue flexibility multiplier):
-            Omega_{i,t} = t * omega_i
-                          + sigma_omega * sqrt(nu_i) * sqrt(t(1-t)) * eps_i
+        Envelope (FoldFlow-style floor):
+            std_i(t)^2 = sigma_omega^2 * nu_i * t(1-t) + min_sigma_omega^2
+        Level 2 uses nu_i = 1. min_sigma_omega = 0 recovers the strict bridge.
 
-        When `nu is None` (or nu ≡ 1), this reduces exactly to Level 2.
-
-        1. Sample R_0 ~ IGSO(3)(sigma=1.5) * R_1 (same prior as Level 1).
+        1. Sample R_0 ~ Uniform(SO(3)) Haar (same prior as Level 1, matches inference).
         2. omega = Log(R_0^T @ R_1) in so(3) ~= R^3.
-        3. Omega_t as above.
+        3. Omega_t = t * omega + std_i(t) * eps.
         4. R_t = R_0 @ Exp(hat(Omega_t)).
-
-        At t=0, Omega_t=0 => R_t = R_0. At t=1, Omega_t = omega => R_t = R_1.
-        sigma_omega=0 recovers Level 1's geodesic interpolation exactly.
         """
         rotmats_0 = self._sample_rotmats_0(rotmats_1, res_mask)
 
         # omega = Log(R_0^T R_1)
         omega = so3_utils.calc_rot_vf(rotmats_0, rotmats_1)        # [B, N, 3]
-        std = sigma_omega * torch.sqrt(t * (1.0 - t) + 1e-8)       # [B, 1]
         if nu is None:
-            std_bn = std.expand_as(res_mask)                       # [B, N]
+            nu_bn = torch.ones_like(res_mask)                      # [B, N]
         else:
-            std_bn = std * torch.sqrt(nu.clamp(min=0.0) + 1e-12)   # [B, N]
-        bridge_noise = torch.randn_like(omega) * std_bn[..., None]  # [B, N, 3]
-        Omega_t = t[..., None] * omega + bridge_noise              # [B, N, 3]
+            nu_bn = nu.clamp(min=0.0)                              # [B, N]
+        var = (sigma_omega ** 2) * nu_bn * (t * (1.0 - t)) + (min_sigma_omega ** 2)
+        std_bn = torch.sqrt(var + 1e-12)                           # [B, N]
+        Omega_t = t[..., None] * omega + std_bn[..., None] * torch.randn_like(omega)
 
         # Push forward to SO(3): R_t = R_0 @ Exp(hat(Omega_t))
         delta_R = so3_utils.rotvec_to_rotmat(Omega_t)              # [B, N, 3, 3]
@@ -220,9 +182,9 @@ class Interpolant:
         rotmats_t = rotmats_t * res_mask[..., None, None] + identity[None, None] * (
             1 - res_mask[..., None, None]
         )
-        return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask), bridge_noise * res_mask[..., None]
+        return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask)
 
-    def corrupt_batch(self, batch, nu=None):
+    def corrupt_batch(self, batch, nu=None, sigma_scale=1.0):
         """
         Params:
             batch (dict) : a dictionary where each key is a tensor name and each value is the corresponding tensor of Rigid objects (representing the RNA frames).
@@ -260,16 +222,17 @@ class Interpolant:
         noisy_batch["t"] = t
 
         if self._level >= 2:
-            sigma_x = float(self._bridge_cfg.bridge.sigma_x)
-            sigma_omega = float(self._bridge_cfg.bridge.sigma_omega)
-            trans_t, trans_bridge_noise = self._corrupt_trans_bridge(
-                trans_1, t, res_mask, sigma_x, nu=nu
+            scale = float(sigma_scale)
+            sigma_x = float(self._bridge_cfg.bridge.sigma_x) * scale
+            sigma_omega = float(self._bridge_cfg.bridge.sigma_omega) * scale
+            min_sigma_x = float(getattr(self._bridge_cfg.bridge, "min_sigma_x", 0.0)) * scale
+            min_sigma_omega = float(getattr(self._bridge_cfg.bridge, "min_sigma_omega", 0.0)) * scale
+            trans_t = self._corrupt_trans_bridge(
+                trans_1, t, res_mask, sigma_x, min_sigma_x, nu=nu
             )
-            rotmats_t, rot_bridge_noise = self._corrupt_rotmats_bridge(
-                rotmats_1, t, res_mask, sigma_omega, nu=nu
+            rotmats_t = self._corrupt_rotmats_bridge(
+                rotmats_1, t, res_mask, sigma_omega, min_sigma_omega, nu=nu
             )
-            noisy_batch["trans_bridge_noise"] = trans_bridge_noise
-            noisy_batch["rot_bridge_noise"] = rot_bridge_noise
         else:
             trans_t = self._corrupt_trans(trans_1, t, res_mask)
             rotmats_t = self._corrupt_rotmats(rotmats_1, t, res_mask)
@@ -331,16 +294,22 @@ class Interpolant:
         """
         sigma_x = float(self._bridge_cfg.bridge.sigma_x)
         sigma_omega = float(self._bridge_cfg.bridge.sigma_omega)
+        min_sigma_x = float(getattr(self._bridge_cfg.bridge, "min_sigma_x", 0.0))
+        min_sigma_omega = float(getattr(self._bridge_cfg.bridge, "min_sigma_omega", 0.0))
 
-        t_envelope = torch.sqrt(t * (1.0 - t) + 1e-8)
+        # Envelope: std_i(t)^2 = sigma^2 * nu_i * t(1-t) + min_sigma^2
+        t_bridge = t * (1.0 - t)
         if nu is None:
-            trans_noise_scale = sigma_x * t_envelope
-            rot_noise_scale = sigma_omega * t_envelope
+            trans_noise_scale = torch.sqrt((sigma_x ** 2) * t_bridge + (min_sigma_x ** 2) + 1e-12)
+            rot_noise_scale = torch.sqrt((sigma_omega ** 2) * t_bridge + (min_sigma_omega ** 2) + 1e-12)
         else:
-            nu_sqrt = torch.sqrt(nu.clamp(min=0.0) + 1e-12)            # [B, N]
-            alpha_bn = nu_sqrt * t_envelope                            # [B, N]
-            trans_noise_scale = sigma_x * alpha_bn[..., None]          # [B, N, 1]
-            rot_noise_scale = sigma_omega * alpha_bn[..., None]        # [B, N, 1]
+            nu_bn = nu.clamp(min=0.0)                                   # [B, N]
+            trans_noise_scale = torch.sqrt(
+                (sigma_x ** 2) * nu_bn * t_bridge + (min_sigma_x ** 2) + 1e-12
+            )[..., None]                                                # [B, N, 1]
+            rot_noise_scale = torch.sqrt(
+                (sigma_omega ** 2) * nu_bn * t_bridge + (min_sigma_omega ** 2) + 1e-12
+            )[..., None]                                                # [B, N, 1]
 
         sqrt_dt = d_t.sqrt()
 
@@ -348,6 +317,9 @@ class Interpolant:
         trans_vf = (pred_trans_1 - trans_t) / (1 - t)
         xi_x = torch.randn_like(trans_t)                                # [B, N, 3]
         trans_new = trans_t + trans_vf * d_t + trans_noise_scale * xi_x * sqrt_dt
+        # CoM recenter to prevent drift from per-residue independent noise
+        # (matches FoldFlow's r3_fm.reverse center=True behavior).
+        trans_new = trans_new - trans_new.mean(dim=-2, keepdim=True)
 
         # --- Rotations: linear-schedule drift + tangent-space bridge noise
         rot_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1)

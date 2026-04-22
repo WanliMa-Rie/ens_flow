@@ -1,11 +1,11 @@
 """Per-residue flexibility predictor for EnsFlow Level 3.
 
-Maps ``(single, pair)`` embeddings to a positive ``nu_i`` on absolute scale
-that scales the Level 2 bridge widths jointly: ``sigma_i = sigma_bar * sqrt(nu_i)``.
+Pair-only head: flexibility is relational (who residue i is packed / paired
+with), so we pool pair features over j and predict nu_i from that context.
 
-Strict L2 ⊂ L3 nesting at init: zero-init the final Linear weight and set its
-bias to ``log(e-1)``, so ``softplus(bias) == 1`` and ``nu_i ≡ 1`` regardless
-of the upstream attention block.
+Strict L2 subset L3 nesting at init: zero-init the final Linear weight and
+set its bias to log(e-1), so softplus(bias) == 1 and nu_i identical 1
+regardless of the upstream MLP.
 """
 
 import math
@@ -15,83 +15,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# softplus(log(e - 1)) == 1.
 _SOFTPLUS_UNITY_BIAS = math.log(math.e - 1.0)
 
 
 class FlexibilityNet(nn.Module):
     def __init__(
         self,
-        c_single_in: int,
         c_pair_in: int,
-        hidden_dim: int = 128,
-        n_heads: int = 4,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        if hidden_dim % n_heads != 0:
-            raise ValueError(
-                f"hidden_dim ({hidden_dim}) must be divisible by n_heads ({n_heads})."
-            )
-        self._n_heads = int(n_heads)
-
-        self.single_ln = nn.LayerNorm(c_single_in)
-        self.single_proj = nn.Linear(c_single_in, hidden_dim)
-
         self.pair_ln = nn.LayerNorm(c_pair_in)
-        self.pair_proj = nn.Linear(c_pair_in, n_heads, bias=False)
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=n_heads,
-            batch_first=True,
-            bias=True,
+        # Pooled features: mean + max over j, plus diagonal (self).
+        in_dim = 3 * c_pair_in
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
-        self.attn_ln = nn.LayerNorm(hidden_dim)
-
-        # Zero-weight + log(e-1) bias gives nu_i ≡ 1 at init (strict L2 ⊂ L3).
         self.head = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.constant_(self.head.bias, _SOFTPLUS_UNITY_BIAS)
 
     def forward(
         self,
-        single_embedding: torch.Tensor,
         pair_embedding: torch.Tensor,
         res_mask: torch.Tensor,
     ) -> torch.Tensor:
-        B, N, _ = single_embedding.shape
-        mask = res_mask.to(single_embedding.dtype)            # [B, N]
-        mask_col = mask[..., None]                            # [B, N, 1]
+        B, N, _, _ = pair_embedding.shape
+        mask = res_mask.to(pair_embedding.dtype)                   # [B, N]
 
-        # Zero padding rows after LN since dataset padding may not be exact zeros.
-        s = self.single_proj(self.single_ln(single_embedding))
-        s = s * mask_col
+        p = self.pair_ln(pair_embedding)                           # [B, N, N, C]
+        mask_j = mask[:, None, :, None]                            # [B, 1, N, 1]
+        p_masked = p * mask_j
 
-        # MHA expects a per-batch, per-head attn_mask flattened to (B*h, N, N).
-        bias = self.pair_proj(self.pair_ln(pair_embedding))     # [B, N, N, h]
-        bias = bias.permute(0, 3, 1, 2).contiguous()            # [B, h, N, N]
-        attn_bias = bias.view(B * self._n_heads, N, N)
+        counts = mask.sum(dim=-1).clamp(min=1.0)[:, None, None]    # [B, 1, 1]
+        p_mean = p_masked.sum(dim=2) / counts                      # [B, N, C]
 
-        # Float key_padding_mask (PyTorch deprecates mixing bool + float masks).
-        key_padding_mask = torch.zeros_like(mask)
-        key_padding_mask = key_padding_mask.masked_fill(mask < 0.5, float("-inf"))
+        neg_inf = torch.finfo(p.dtype).min
+        p_for_max = p.masked_fill(mask_j < 0.5, neg_inf)
+        p_max = p_for_max.max(dim=2).values                        # [B, N, C]
 
-        attn_out, _ = self.attn(
-            query=s,
-            key=s,
-            value=s,
-            attn_mask=attn_bias,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        # MHA can return NaN on fully-masked rows; sanitize before residual add.
-        attn_out = torch.nan_to_num(attn_out, nan=0.0)
-        s = self.attn_ln(s + attn_out)
-        s = s * mask_col
+        idx = torch.arange(N, device=p.device)
+        p_self = p[:, idx, idx, :]                                 # [B, N, C]
 
-        raw = self.head(s).squeeze(-1)                           # [B, N]
+        feats = torch.cat([p_mean, p_max, p_self], dim=-1)         # [B, N, 3C]
+        raw = self.head(self.mlp(feats)).squeeze(-1)               # [B, N]
+        # Clamp raw to keep softplus in [~0.05, ~e^3]. Paired with clamped
+        # log_b_hat target in _compute_flex_losses; prevents pathological
+        # gradient explosions from B-factor outliers.
+        raw = raw.clamp(min=-3.0, max=3.0)
         nu = F.softplus(raw)
 
-        # 1.0 on padding so a detached nu used as a width multiplier is a no-op.
         nu = nu * mask + (1.0 - mask)
         return nu
