@@ -351,7 +351,7 @@ class FlowModule(LightningModule):
             - ``gt_c4_ensemble``: all real experimental conformers [K, L, 3]
             - ``res_mask``: anchor residue mask [L]
 
-        Metric families are split-specific to match ``evaluate_metrics.py``:
+        Metric families are split-specific to match ``../eval/evaluate_metrics.py``:
 
             - ``single`` loader (test_single, K==1):
                 ``rmsd`` = best-of-G RMSD vs the anchor

@@ -26,6 +26,13 @@ def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
     return trans_t * diffuse_mask[..., None] + trans_1 * (1 - diffuse_mask[..., None])
 
 
+def _center_trans_masked(trans, res_mask):
+    mask = res_mask[..., None].to(trans.dtype)
+    denom = mask.sum(dim=-2, keepdim=True).clamp(min=1.0)
+    center = (trans * mask).sum(dim=-2, keepdim=True) / denom
+    return (trans - center) * mask
+
+
 def _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
     return rotmats_t * diffuse_mask[..., None, None] + rotmats_1 * (
         1 - diffuse_mask[..., None, None]
@@ -125,13 +132,14 @@ class Interpolant:
         num_batch, num_res = res_mask.shape
         return _uniform_so3(num_batch, num_res, self._device)
 
-    def _corrupt_trans_bridge(self, trans_1, t, res_mask, sigma_x, min_sigma_x, nu=None):
+    def _corrupt_trans_bridge(self, trans_1, t, res_mask, sigma_x, nu=None):
         """Euclidean Brownian bridge in translation space.
 
-        Envelope (FoldFlow-style floor):
-            std_i(t)^2 = sigma_x^2 * nu_i * t(1-t) + min_sigma_x^2
-        Level 2 uses nu_i = 1. min_sigma_x = 0 recovers the strict bridge.
-        Per-residue independent Gaussian noise; no CoM re-centering.
+        Envelope:
+            std_i(t)^2 = sigma_x^2 * nu_i * t(1-t)
+        Level 2 uses nu_i = 1. Translation states are mask-aware
+        re-centered after noise injection to keep the training distribution in
+        the same zero-CoM gauge used by preprocessing and inference.
         """
         trans_nm_0 = _centered_gaussian(*res_mask.shape, self._device)
         trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
@@ -143,19 +151,19 @@ class Interpolant:
             nu_bn = torch.ones_like(res_mask)                         # [B, N]
         else:
             nu_bn = nu.clamp(min=0.0)                                 # [B, N]
-        var = (sigma_x ** 2) * nu_bn * (t * (1.0 - t)) + (min_sigma_x ** 2)
-        std_bn = torch.sqrt(var + 1e-12)                              # [B, N]
+        var = (sigma_x ** 2) * nu_bn * (t * (1.0 - t))
+        std_bn = torch.sqrt(var.clamp(min=0.0))                       # [B, N]
 
         trans_t = mean + std_bn[..., None] * torch.randn_like(mean)
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
-        return trans_t * res_mask[..., None]
+        return _center_trans_masked(trans_t, res_mask)
 
-    def _corrupt_rotmats_bridge(self, rotmats_1, t, res_mask, sigma_omega, min_sigma_omega, nu=None):
+    def _corrupt_rotmats_bridge(self, rotmats_1, t, res_mask, sigma_omega, nu=None):
         """Tangent-space-lifted Brownian bridge on SO(3).
 
-        Envelope (FoldFlow-style floor):
-            std_i(t)^2 = sigma_omega^2 * nu_i * t(1-t) + min_sigma_omega^2
-        Level 2 uses nu_i = 1. min_sigma_omega = 0 recovers the strict bridge.
+        Envelope:
+            std_i(t)^2 = sigma_omega^2 * nu_i * t(1-t)
+        Level 2 uses nu_i = 1.
 
         1. Sample R_0 ~ Uniform(SO(3)) Haar (same prior as Level 1, matches inference).
         2. omega = Log(R_0^T @ R_1) in so(3) ~= R^3.
@@ -170,8 +178,8 @@ class Interpolant:
             nu_bn = torch.ones_like(res_mask)                      # [B, N]
         else:
             nu_bn = nu.clamp(min=0.0)                              # [B, N]
-        var = (sigma_omega ** 2) * nu_bn * (t * (1.0 - t)) + (min_sigma_omega ** 2)
-        std_bn = torch.sqrt(var + 1e-12)                           # [B, N]
+        var = (sigma_omega ** 2) * nu_bn * (t * (1.0 - t))
+        std_bn = torch.sqrt(var.clamp(min=0.0))                    # [B, N]
         Omega_t = t[..., None] * omega + std_bn[..., None] * torch.randn_like(omega)
 
         # Push forward to SO(3): R_t = R_0 @ Exp(hat(Omega_t))
@@ -225,13 +233,11 @@ class Interpolant:
             scale = float(sigma_scale)
             sigma_x = float(self._bridge_cfg.bridge.sigma_x) * scale
             sigma_omega = float(self._bridge_cfg.bridge.sigma_omega) * scale
-            min_sigma_x = float(getattr(self._bridge_cfg.bridge, "min_sigma_x", 0.0)) * scale
-            min_sigma_omega = float(getattr(self._bridge_cfg.bridge, "min_sigma_omega", 0.0)) * scale
             trans_t = self._corrupt_trans_bridge(
-                trans_1, t, res_mask, sigma_x, min_sigma_x, nu=nu
+                trans_1, t, res_mask, sigma_x, nu=nu
             )
             rotmats_t = self._corrupt_rotmats_bridge(
-                rotmats_1, t, res_mask, sigma_omega, min_sigma_omega, nu=nu
+                rotmats_1, t, res_mask, sigma_omega, nu=nu
             )
         else:
             trans_t = self._corrupt_trans(trans_1, t, res_mask)
@@ -287,28 +293,27 @@ class Interpolant:
         Drift identical to the deterministic ODE under the linear rotation
         schedule; diffusion follows the training bridge envelope
         sigma * sqrt(t(1-t)) per unit time, optionally scaled per residue
-        by sqrt(nu_i). Per-residue independent noise (no CoM constraint).
-        Rotation noise lives in the Lie algebra and is added inside the exp.
+        by sqrt(nu_i). Translation is re-centered after the update to stay in
+        the zero-CoM gauge. Rotation noise lives in the Lie algebra and is
+        added inside the exp.
 
         Requires self._level >= 2.
         """
         sigma_x = float(self._bridge_cfg.bridge.sigma_x)
         sigma_omega = float(self._bridge_cfg.bridge.sigma_omega)
-        min_sigma_x = float(getattr(self._bridge_cfg.bridge, "min_sigma_x", 0.0))
-        min_sigma_omega = float(getattr(self._bridge_cfg.bridge, "min_sigma_omega", 0.0))
 
-        # Envelope: std_i(t)^2 = sigma^2 * nu_i * t(1-t) + min_sigma^2
+        # Envelope: std_i(t)^2 = sigma^2 * nu_i * t(1-t)
         t_bridge = t * (1.0 - t)
         if nu is None:
-            trans_noise_scale = torch.sqrt((sigma_x ** 2) * t_bridge + (min_sigma_x ** 2) + 1e-12)
-            rot_noise_scale = torch.sqrt((sigma_omega ** 2) * t_bridge + (min_sigma_omega ** 2) + 1e-12)
+            trans_noise_scale = torch.sqrt(((sigma_x ** 2) * t_bridge).clamp(min=0.0))
+            rot_noise_scale = torch.sqrt(((sigma_omega ** 2) * t_bridge).clamp(min=0.0))
         else:
             nu_bn = nu.clamp(min=0.0)                                   # [B, N]
             trans_noise_scale = torch.sqrt(
-                (sigma_x ** 2) * nu_bn * t_bridge + (min_sigma_x ** 2) + 1e-12
+                ((sigma_x ** 2) * nu_bn * t_bridge).clamp(min=0.0)
             )[..., None]                                                # [B, N, 1]
             rot_noise_scale = torch.sqrt(
-                (sigma_omega ** 2) * nu_bn * t_bridge + (min_sigma_omega ** 2) + 1e-12
+                ((sigma_omega ** 2) * nu_bn * t_bridge).clamp(min=0.0)
             )[..., None]                                                # [B, N, 1]
 
         sqrt_dt = d_t.sqrt()
@@ -464,4 +469,3 @@ class Interpolant:
         )
 
         return atom37_traj_rna, clean_atom37_traj_rna, clean_traj
-

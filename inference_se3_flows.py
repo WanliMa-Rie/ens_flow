@@ -2,7 +2,7 @@
 Inference script for Conditional RNA-FrameFlow.
 Reads test clusters from split_cdhit80.json in ensemble_dataset,
 runs level-dependent sampling, and saves .cif files to the output directory.
-Metrics are computed separately via evaluate_metrics.py.
+Metrics are computed separately via ../eval/evaluate_metrics.py.
 """
 
 import os
@@ -147,8 +147,8 @@ class Sampler:
         # load without missing keys. L>=2 ckpts have it in their state_dict.
         cfg.model.node_features.use_nu_film = self._level >= 2
 
-        # Output directory: /projects/u6bk/wanli/inference_ours/ens_flow{level}/
-        default_output = f"/projects/u6bk/wanli/inference_ours/ens_flow{self._level}"
+        # Output directory: /projects/u6iy/wanli/inference_ours/ens_flow{level}/
+        default_output = f"/projects/u6iy/wanli/inference_ours/ens_flow{self._level}"
         self._output_dir = str(
             getattr(self._infer_cfg, "output_dir", default_output) or default_output
         )
